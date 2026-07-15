@@ -103,7 +103,7 @@ jobs:
       - name: Patch APK
         if: steps.check.outputs.exists == 'false'
         run: |
-          OUTPUT="doubaoime_${{ steps.check.outputs.version }}_系统字体版.apk"
+          OUTPUT="doubaoime-${{ steps.check.outputs.version }}-fontpatch.apk"
           BAKSMALI_JAR=/tmp/baksmali.jar SMALI_JAR=/tmp/smali.jar \
             python3 patch/ci-patch.py \
               "${{ steps.check.outputs.filename }}" \
