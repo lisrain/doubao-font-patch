@@ -54,7 +54,7 @@ jobs:
 
           echo "API response: $RESP"
 
-          VERSION=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['version_name'])")
+          VERSION=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d['data']['version_name']; print(v.lstrip('vV'))")
           VERSION_CODE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['version_code'])")
           URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['url'])")
           FILENAME=$(basename "$URL")
@@ -64,7 +64,7 @@ jobs:
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
 
-          # 检查是否已有此版本的 release
+          # 统一 tag 格式：v1.3.15
           TAG="v${VERSION}"
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
