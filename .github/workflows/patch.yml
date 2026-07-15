@@ -11,11 +11,52 @@ env:
   SMALI_VERSION: "3.0.9"
 
 jobs:
-  check-and-patch:
+  check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      exists: ${{ steps.version.outputs.exists }}
+      version: ${{ steps.version.outputs.version }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      url: ${{ steps.version.outputs.url }}
+      filename: ${{ steps.version.outputs.filename }}
+    steps:
+      - name: Check for new version
+        id: version
+        run: |
+          RESP=$(curl -s "$API_URL" \
+            -H "accept: */*" \
+            -H "referer: https://shurufa.doubao.com/h5" \
+            -H "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
+          echo "API response: $RESP"
+
+          VERSION=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d['data']['version_name']; print(v.lstrip('vV'))")
+          VERSION_CODE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['version_code'])")
+          URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['url'])")
+          FILENAME=$(basename "$URL")
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+
+          TAG="v${VERSION}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $TAG already released, skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New version found: $TAG (code: $VERSION_CODE)"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  patch:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      output_file: ${{ steps.patch.outputs.output_file }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -40,50 +81,15 @@ jobs:
             "https://github.com/baksmali/smali/releases/download/${{ env.SMALI_VERSION }}/baksmali-${{ env.SMALI_VERSION }}-fat.jar"
           curl -sL -o /tmp/smali.jar \
             "https://github.com/baksmali/smali/releases/download/${{ env.SMALI_VERSION }}/smali-${{ env.SMALI_VERSION }}-fat.jar"
-          ls -lh /tmp/baksmali.jar /tmp/smali.jar
           java -jar /tmp/baksmali.jar --version
           java -jar /tmp/smali.jar --version
 
-      - name: Check for new version
-        id: check
-        run: |
-          RESP=$(curl -s "$API_URL" \
-            -H "accept: */*" \
-            -H "referer: https://shurufa.doubao.com/h5" \
-            -H "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-          echo "API response: $RESP"
-
-          VERSION=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d['data']['version_name']; print(v.lstrip('vV'))")
-          VERSION_CODE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['version_code'])")
-          URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['url'])")
-          FILENAME=$(basename "$URL")
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-
-          # 统一 tag 格式：v1.3.15
-          TAG="v${VERSION}"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Version $TAG already released, skipping."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "New version found: $TAG (code: $VERSION_CODE)"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Download original APK
-        if: steps.check.outputs.exists == 'false'
         run: |
-          curl -L -o "${{ steps.check.outputs.filename }}" "${{ steps.check.outputs.url }}"
-          ls -lh "${{ steps.check.outputs.filename }}"
+          curl -L -o "${{ needs.check.outputs.filename }}" "${{ needs.check.outputs.url }}"
+          ls -lh "${{ needs.check.outputs.filename }}"
 
       - name: Decode signing keystore
-        if: steps.check.outputs.exists == 'false'
         run: |
           if [ -n "${{ secrets.ANDROID_SIGN_KEYSTORE }}" ]; then
             echo "${{ secrets.ANDROID_SIGN_KEYSTORE }}" | base64 -d > /tmp/debug.keystore
@@ -101,32 +107,41 @@ jobs:
           fi
 
       - name: Patch APK
-        if: steps.check.outputs.exists == 'false'
         run: |
-          OUTPUT="doubaoime-${{ steps.check.outputs.version }}-fontpatch.apk"
+          OUTPUT="doubaoime-${{ needs.check.outputs.version }}-fontpatch.apk"
           BAKSMALI_JAR=/tmp/baksmali.jar SMALI_JAR=/tmp/smali.jar \
             python3 patch/ci-patch.py \
-              "${{ steps.check.outputs.filename }}" \
+              "${{ needs.check.outputs.filename }}" \
               "$OUTPUT" \
               --keystore /tmp/debug.keystore
           echo "output_file=$OUTPUT" >> "$GITHUB_OUTPUT"
         id: patch
 
-      - name: Upload artifact (temporary storage)
-        if: steps.check.outputs.exists == 'false'
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: doubaoime-${{ steps.check.outputs.version }}-patched
+          name: doubaoime-${{ needs.check.outputs.version }}-patched
           path: ${{ steps.patch.outputs.output_file }}
           retention-days: 90
 
+  release:
+    needs: [check, patch]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: doubaoime-${{ needs.check.outputs.version }}-patched
+
       - name: Create GitHub Release
-        if: steps.check.outputs.exists == 'false'
         run: |
-          TAG="v${{ steps.check.outputs.version }}"
-          OUTPUT="${{ steps.patch.outputs.output_file }}"
-          VERSION="${{ steps.check.outputs.version }}"
-          VC="${{ steps.check.outputs.version_code }}"
+          TAG="v${{ needs.check.outputs.version }}"
+          VERSION="${{ needs.check.outputs.version }}"
+          VC="${{ needs.check.outputs.version_code }}"
+          OUTPUT=$(ls *.apk)
 
           cat > /tmp/release_body.md << EOF
           ## 豆包输入法 ${VERSION} - 系统字体版
@@ -153,20 +168,3 @@ jobs:
             --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Summary
-        if: always()
-        run: |
-          if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
-            echo "### Already up to date" >> "$GITHUB_STEP_SUMMARY"
-            echo "Version **${{ steps.check.outputs.version }}** already has a release." >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ steps.check.outputs.exists }}" = "false" ]; then
-            echo "### Release created" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Version**: ${{ steps.check.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **File**: ${{ steps.patch.outputs.output_file }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Tag**: v${{ steps.check.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Artifact**: [Download from workflow artifacts](../actions)" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### Check failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "Could not determine version status." >> "$GITHUB_STEP_SUMMARY"
-          fi
