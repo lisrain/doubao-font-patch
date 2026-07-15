@@ -19,11 +19,8 @@ patch/debug-keystore-secret.txt
 api/
 example/
 
-# === LSPosed 模块构建产物 ===
-DoubaoFontPatch/app/build/
-DoubaoFontPatch/local.properties
-DoubaoFontPatch/.gradle/
-DoubaoFontPatch/build/
+# === LSPosed 模块（本地项目） ===
+DoubaoFontPatch/
 
 # === IDE / 工具目录 ===
 .claude/
