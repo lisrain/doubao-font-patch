@@ -1,0 +1,41 @@
+# === APK 文件（大二进制，不入仓） ===
+*.apk
+
+# === 本地构建/脚本（CI 不需要） ===
+patch/build.bat
+patch/build.sh
+patch/patch-font.py
+patch/download-apk.py
+patch/download-apk.bat
+
+# === 本地文档/临时文件 ===
+patch/diff.md
+patch/block-upgrade.md
+patch/README.zip
+patch/debug-keystore-base64.txt
+patch/debug-keystore-secret.txt
+
+# === 参考项目（独立 git 仓库） ===
+api/
+example/
+
+# === LSPosed 模块构建产物 ===
+DoubaoFontPatch/app/build/
+DoubaoFontPatch/local.properties
+DoubaoFontPatch/.gradle/
+DoubaoFontPatch/build/
+
+# === IDE / 工具目录 ===
+.claude/
+.mimocode/
+.idea/
+temp/
+tmp/
+
+# === Python ===
+__pycache__/
+*.pyc
+
+# === 其他项目目录（不动） ===
+MonetPatch/
+Sources/
