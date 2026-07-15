@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">豆包字体补丁</string>
-    <string name="module_description">将豆包输入法的自定义字体替换为系统字体</string>
-</resources>
