@@ -41,7 +41,7 @@ jobs:
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
 
           TAG="v${VERSION}"
-          if gh release view "$TAG" > /dev/null 2>&1; then
+          if gh api "repos/${{ github.repository }}/git/ref/tags/$TAG" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Version $TAG already released, skipping."
           else
@@ -131,6 +131,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Download artifact
         uses: actions/download-artifact@v7
         with:
