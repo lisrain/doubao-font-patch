@@ -1,173 +1,265 @@
 name: Build Patched APK
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/patch.yml"
+      - "patch/**"
+      - "README.md"
+  pull_request:
+    paths:
+      - ".github/workflows/patch.yml"
+      - "patch/**"
+      - "README.md"
   schedule:
     # 每天北京时间 04:00 检查（UTC 20:00）
-    - cron: '0 20 * * *'
-  workflow_dispatch:  # 手动触发
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "构建成功后发布当前补丁版本"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: doubao-patch-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   API_URL: https://shurufa.doubao.com/api/v1/app/download_url?platform=android
-  SMALI_VERSION: "3.0.9"
+  PATCH_REVISION: "2"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  BAKSMALI_SHA256: d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5
+  SMALI_SHA256: 9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116
 
 jobs:
-  check:
+  metadata:
     runs-on: ubuntu-latest
     outputs:
-      exists: ${{ steps.version.outputs.exists }}
-      version: ${{ steps.version.outputs.version }}
-      version_code: ${{ steps.version.outputs.version_code }}
-      url: ${{ steps.version.outputs.url }}
-      filename: ${{ steps.version.outputs.filename }}
+      version: ${{ steps.meta.outputs.version }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      url: ${{ steps.meta.outputs.url }}
+      filename: ${{ steps.meta.outputs.filename }}
+      tag: ${{ steps.meta.outputs.tag }}
+      should_build: ${{ steps.meta.outputs.should_build }}
+      should_release: ${{ steps.meta.outputs.should_release }}
     steps:
-      - name: Check for new version
-        id: version
+      - name: Resolve official APK and build policy
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUEST_RELEASE: ${{ inputs.release || 'false' }}
         run: |
-          RESP=$(curl -s "$API_URL" \
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors \
             -H "accept: */*" \
             -H "referer: https://shurufa.doubao.com/h5" \
-            -H "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            -H "user-agent: Mozilla/5.0 GitHub-Actions" \
+            "$API_URL" > "$response_file"
 
-          echo "API response: $RESP"
-
-          VERSION=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d['data']['version_name']; print(v.lstrip('vV'))")
-          VERSION_CODE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['version_code'])")
-          URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['url'])")
-          FILENAME=$(basename "$URL")
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-
-          TAG="v${VERSION}"
-          if gh api "repos/${{ github.repository }}/git/ref/tags/$TAG" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Version $TAG already released, skipping."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "New version found: $TAG (code: $VERSION_CODE)"
+          code="$(jq -r '.code' "$response_file")"
+          if [ "$code" != "0" ]; then
+            jq . "$response_file"
+            echo "Doubao download API returned code=$code" >&2
+            exit 1
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  patch:
-    needs: check
-    if: needs.check.outputs.exists == 'false'
+          version="$(jq -r '.data.version_name | sub("^[vV]"; "")' "$response_file")"
+          version_code="$(jq -r '.data.version_code' "$response_file")"
+          url="$(jq -r '.data.url' "$response_file")"
+          filename="$(basename "${url%%\?*}")"
+          tag="v${version}-patch${PATCH_REVISION}"
+
+          exists=false
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          should_build=false
+          should_release=false
+          case "$EVENT_NAME" in
+            push|pull_request)
+              should_build=true
+              ;;
+            schedule)
+              if [ "$exists" = false ]; then
+                should_build=true
+                should_release=true
+              fi
+              ;;
+            workflow_dispatch)
+              should_build=true
+              if [ "$REQUEST_RELEASE" = true ] && [ "$exists" = false ]; then
+                should_release=true
+              fi
+              ;;
+          esac
+
+          {
+            echo "version=$version"
+            echo "version_code=$version_code"
+            echo "url=$url"
+            echo "filename=$filename"
+            echo "tag=$tag"
+            echo "should_build=$should_build"
+            echo "should_release=$should_release"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Official version: $version ($version_code)"
+          echo "Release tag: $tag (exists=$exists)"
+          echo "Build=$should_build Release=$should_release"
+
+  build:
+    needs: metadata
+    if: needs.metadata.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     outputs:
-      output_file: ${{ steps.patch.outputs.output_file }}
+      artifact_name: ${{ steps.names.outputs.artifact_name }}
+      output_file: ${{ steps.names.outputs.output_file }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Java 21
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: "21"
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Setup Android SDK (apksigner)
-        uses: android-actions/setup-android@v4
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
 
-      - name: Download smali/baksmali ${{ env.SMALI_VERSION }}
+      - name: Verify bundled smali tools
         run: |
-          curl -sL -o /tmp/baksmali.jar \
-            "https://github.com/baksmali/smali/releases/download/${{ env.SMALI_VERSION }}/baksmali-${{ env.SMALI_VERSION }}-fat.jar"
-          curl -sL -o /tmp/smali.jar \
-            "https://github.com/baksmali/smali/releases/download/${{ env.SMALI_VERSION }}/smali-${{ env.SMALI_VERSION }}-fat.jar"
-          java -jar /tmp/baksmali.jar --version
-          java -jar /tmp/smali.jar --version
+          set -euo pipefail
+          echo "$BAKSMALI_SHA256  patch/baksmali.jar" | sha256sum --check --strict
+          echo "$SMALI_SHA256  patch/smali.jar" | sha256sum --check --strict
+          java -jar patch/baksmali.jar --version
+          java -jar patch/smali.jar --version
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools
+        run: sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
 
       - name: Download original APK
         run: |
-          curl -L -o "${{ needs.check.outputs.filename }}" "${{ needs.check.outputs.url }}"
-          ls -lh "${{ needs.check.outputs.filename }}"
+          set -euo pipefail
+          curl --fail --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output "${{ needs.metadata.outputs.filename }}" \
+            "${{ needs.metadata.outputs.url }}"
+          test -s "${{ needs.metadata.outputs.filename }}"
+          ls -lh "${{ needs.metadata.outputs.filename }}"
 
-      - name: Decode signing keystore
+      - name: Prepare signing keystore
+        env:
+          ANDROID_SIGN_KEYSTORE: ${{ secrets.ANDROID_SIGN_KEYSTORE }}
         run: |
-          if [ -n "${{ secrets.ANDROID_SIGN_KEYSTORE }}" ]; then
-            echo "${{ secrets.ANDROID_SIGN_KEYSTORE }}" | base64 -d > /tmp/debug.keystore
-            echo "Using stored keystore"
+          set -euo pipefail
+          if [ -n "$ANDROID_SIGN_KEYSTORE" ]; then
+            printf '%s' "$ANDROID_SIGN_KEYSTORE" | base64 --decode > "$RUNNER_TEMP/debug.keystore"
+            echo "Using repository signing keystore"
           else
-            keytool -genkey -v \
-              -keystore /tmp/debug.keystore \
+            keytool -genkeypair -noprompt \
+              -keystore "$RUNNER_TEMP/debug.keystore" \
               -alias androiddebugkey \
               -storepass android \
               -keypass android \
               -keyalg RSA -keysize 2048 \
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
-            echo "Generated temporary debug keystore"
+            echo "ANDROID_SIGN_KEYSTORE is unset; generated an ephemeral debug keystore"
           fi
 
-      - name: Patch APK
+      - name: Set output names
+        id: names
         run: |
-          OUTPUT="doubaoime-${{ needs.check.outputs.version }}-fontpatch.apk"
-          BAKSMALI_JAR=/tmp/baksmali.jar SMALI_JAR=/tmp/smali.jar \
-            python3 patch/ci-patch.py \
-              "${{ needs.check.outputs.filename }}" \
-              "$OUTPUT" \
-              --keystore /tmp/debug.keystore
-          echo "output_file=$OUTPUT" >> "$GITHUB_OUTPUT"
-        id: patch
+          output_file="doubaoime-${{ needs.metadata.outputs.version }}-fontpatch-association.apk"
+          artifact_name="doubaoime-${{ needs.metadata.outputs.version }}-patched"
+          echo "output_file=$output_file" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Patch and sign APK
+        env:
+          BAKSMALI_JAR: ${{ github.workspace }}/patch/baksmali.jar
+          SMALI_JAR: ${{ github.workspace }}/patch/smali.jar
+        run: |
+          set -euo pipefail
+          export APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          uv run --python 3.12 patch/ci-patch.py \
+            "${{ needs.metadata.outputs.filename }}" \
+            "${{ steps.names.outputs.output_file }}" \
+            --keystore "$RUNNER_TEMP/debug.keystore"
+
+      - name: Verify output APK
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "${{ steps.names.outputs.output_file }}"
+          sha256sum "${{ steps.names.outputs.output_file }}" | tee "${{ steps.names.outputs.output_file }}.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: doubaoime-${{ needs.check.outputs.version }}-patched
-          path: ${{ steps.patch.outputs.output_file }}
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: |
+            ${{ steps.names.outputs.output_file }}
+            ${{ steps.names.outputs.output_file }}.sha256
+          if-no-files-found: error
           retention-days: 90
 
   release:
-    needs: [check, patch]
-    if: needs.check.outputs.exists == 'false'
+    needs: [metadata, build]
+    if: needs.metadata.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Download artifact
-        uses: actions/download-artifact@v7
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
         with:
-          name: doubaoime-${{ needs.check.outputs.version }}-patched
+          name: ${{ needs.build.outputs.artifact_name }}
 
       - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v${{ needs.check.outputs.version }}"
-          VERSION="${{ needs.check.outputs.version }}"
-          VC="${{ needs.check.outputs.version_code }}"
-          OUTPUT=$(ls *.apk)
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          ## 修改内容
 
-          cat > /tmp/release_body.md << EOF
-          ## 豆包输入法 ${VERSION} - 系统字体版
+          - 将 qihei、misans 等非图标字体替换为系统字体
+          - 保留 oimeui2023、oimeui2025 图标字体及皮肤 `.ttf` 字体
+          - 在“设置 → 智能联想”中加入“英文单词补全联想”开关，默认开启
+          - 关闭开关后禁用英文 native association，并阻止光标触发单词补全
+          - 修复 `claude-opus-4` 等英文标识符切换数字/符号键盘后被覆盖或整段候选重复追加
 
-          基于官方 v${VERSION} (version_code: ${VC}) 打补丁。
+          ## 签名
 
-          ### 修改内容
-
-          - 移除 \`updateIsSupportSystemFont()\` 调用
-          - 将所有非图标字体（qihei、misans 等）替换为系统字体 (\`Typeface.create\`)
-          - 保留图标字体 (oimeui2023/oimeui2025) 和皮肤字体 (.ttf)
-
-          ### 签名
-
-          使用 Android Debug 证书签名（V1+V2+V3），可直接安装。
-
-          > 如安装失败，请用 MT 管理器等工具重新签名后安装。
+          APK 已通过 `apksigner verify` 的 V2/V3 签名验证，附件同时提供 SHA-256 文件。
           EOF
 
-          gh release create "$TAG" \
-            "$OUTPUT" \
-            --title "v${VERSION} 系统字体版" \
-            --notes-file /tmp/release_body.md \
+          gh release create "${{ needs.metadata.outputs.tag }}" \
+            "${{ needs.build.outputs.output_file }}" \
+            "${{ needs.build.outputs.output_file }}.sha256" \
+            --title "豆包输入法 ${{ needs.metadata.outputs.version }} 补丁版（patch ${{ env.PATCH_REVISION }}）" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

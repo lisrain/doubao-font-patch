@@ -6,6 +6,10 @@
   1. KeyboardView.createTypeFace() → 保留图标字体，其余用系统字体
   2. CandidateListView / CandidateIdleView / MoreCandidateSyllableAdapter
      中直接加载 R.font.qihei → 系统字体
+  3. 智能联想页面增加“英文单词补全联想”开关
+  4. 开关关闭时，英文键盘光标更新不再请求单词补全联想
+  5. 关闭开关时，英文 ASCII 标识符不因 SetPreeditRange 重新进入可覆盖编辑状态
+  6. 数字/符号键盘切换前提交英文 composing 文本
 """
 
 import argparse
@@ -15,11 +19,25 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 SMALI_KEYBOARD_VIEW = "com/bytedance/android/input/keyboard/KeyboardView.smali"
+SMALI_SETTINGS_CONFIG = "com/bytedance/android/input/common/SettingsConfigNext.smali"
+SMALI_KEYBOARD_JNI = "com/bytedance/android/doubaoime/KeyboardJni.smali"
+SMALI_KEYBOARD_SELECTION = "com/bytedance/android/doubaoime/KeyboardJni$1.smali"
+SMALI_BOARD_SWITCH = (
+    "com/bytedance/android/input/keyboard/areacontrol/InputViewRoot$F.smali"
+)
+SMALI_ASSOCIATION_FRAGMENT = (
+    "com/bytedance/android/input/fragment/settings/"
+    "IntelligentAssociationFragment.smali"
+)
+ASSOCIATION_PATCH_CLASS = (
+    "Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;"
+)
 
 # R.font.qihei 的资源 ID
 QIHEI_FONT_RES_ID = "0x7f090003"
@@ -27,6 +45,382 @@ QIHEI_FONT_RES_ID = "0x7f090003"
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
 KEY_PASS = "android"
+
+
+def get_method_bounds(smali, declaration):
+    """返回指定 smali 方法的起止位置。"""
+    start = smali.index(declaration)
+    end = smali.index(".end method", start) + len(".end method")
+    return start, end
+
+
+def insert_after_registers(method, snippet):
+    """在方法 .registers 指令后插入代码。"""
+    match = re.search(r"(^\s*\.registers\s+\d+\s*$)", method, re.MULTILINE)
+    if not match:
+        raise ValueError("方法中未找到 .registers")
+    pos = match.end()
+    return method[:pos] + "\n\n" + snippet.rstrip() + method[pos:]
+
+
+def replace_method(smali, declaration, transform):
+    """定位并转换一个 smali 方法。"""
+    start, end = get_method_bounds(smali, declaration)
+    old_method = smali[start:end]
+    new_method = transform(old_method)
+    if new_method == old_method:
+        raise ValueError(f"方法未发生修改: {declaration}")
+    return smali[:start] + new_method + smali[end:]
+
+
+def patch_settings_config(smali_path):
+    """让自定义布尔配置复用原有 SettingsConfigNext 跨进程同步链路。"""
+    print("  修补 SettingsConfigNext 自定义配置支持...")
+    smali = smali_path.read_text(encoding="utf-8")
+
+    get_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :patch_assoc_get_continue
+
+    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->isEnabled()Z
+
+    move-result v0
+
+    invoke-static {{v0}}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;
+
+    move-result-object v0
+
+    return-object v0
+
+    :patch_assoc_get_continue"""
+    smali = replace_method(
+        smali,
+        ".method public static final f(Ljava/lang/String;)Ljava/lang/Object;",
+        lambda method: insert_after_registers(method, get_snippet),
+    )
+
+    get_default_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :patch_assoc_get_default_continue
+
+    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->isEnabled()Z
+
+    move-result v0
+
+    invoke-static {{v0}}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;
+
+    move-result-object v0
+
+    return-object v0
+
+    :patch_assoc_get_default_continue"""
+    smali = replace_method(
+        smali,
+        ".method public static final g(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
+        lambda method: insert_after_registers(method, get_default_snippet),
+    )
+
+    set_object_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :patch_assoc_set_object_continue
+
+    instance-of v0, p1, Ljava/lang/Boolean;
+
+    if-eqz v0, :patch_assoc_set_object_continue
+
+    check-cast p1, Ljava/lang/Boolean;
+
+    invoke-virtual {{p1}}, Ljava/lang/Boolean;->booleanValue()Z
+
+    move-result v0
+
+    invoke-static {{v0}}, {ASSOCIATION_PATCH_CLASS}->setEnabled(Z)V
+
+    return-void
+
+    :patch_assoc_set_object_continue"""
+    smali = replace_method(
+        smali,
+        ".method public static final o(Ljava/lang/String;Ljava/lang/Object;)V",
+        lambda method: insert_after_registers(method, set_object_snippet),
+    )
+
+    set_string_snippet = f"""    invoke-static {{p1}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :patch_assoc_set_string_continue
+
+    invoke-static {{p2}}, {ASSOCIATION_PATCH_CLASS}->setFromString(Ljava/lang/String;)V
+
+    return-void
+
+    :patch_assoc_set_string_continue"""
+    smali = replace_method(
+        smali,
+        ".method public final m(Ljava/lang/String;Ljava/lang/String;)V",
+        lambda method: insert_after_registers(method, set_string_snippet),
+    )
+
+    known_key_old = """    move-result p1
+
+    if-nez p1, :cond_7e
+"""
+    known_key_new = f"""    move-result p1
+
+    if-nez p1, :cond_7e
+
+    invoke-static {{p2}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+
+    move-result p1
+
+    if-nez p1, :cond_7e
+"""
+    start, end = get_method_bounds(
+        smali,
+        ".method public onSharedPreferenceChanged("
+        "Landroid/content/SharedPreferences;Ljava/lang/String;)V",
+    )
+    method = smali[start:end]
+    if method.count(known_key_old) != 1:
+        raise ValueError("onSharedPreferenceChanged containsKey 分支不符合预期")
+    method = method.replace(known_key_old, known_key_new, 1)
+    smali = smali[:start] + method + smali[end:]
+
+    checks = {
+        "自定义配置读取": "patch_assoc_get_continue" in smali,
+        "自定义配置默认读取": "patch_assoc_get_default_continue" in smali,
+        "设置进程写入": "patch_assoc_set_object_continue" in smali,
+        "输入法进程写入": "patch_assoc_set_string_continue" in smali,
+        "未知键转为已知键": known_key_new in smali,
+    }
+    for desc, ok in checks.items():
+        print(f"    [{'✓' if ok else '✗'}] {desc}")
+    if not all(checks.values()):
+        return False
+
+    smali_path.write_text(smali, encoding="utf-8")
+    return True
+
+
+def patch_selection_association(smali_path):
+    """在 SelectionUpdatedParams 送入 native 前过滤英文光标联想。"""
+    print("  修补 KeyboardJni 光标联想参数...")
+    smali = smali_path.read_text(encoding="utf-8")
+
+    field_patches = [
+        (
+            "need_association:Z",
+            "filterNeedAssociation",
+        ),
+        (
+            "is_cursor_change_tag_for_association_disabled:Z",
+            "filterAssociationDisabled",
+        ),
+    ]
+    for field_name, helper_method in field_patches:
+        pattern = re.compile(
+            rf"(?P<indent>^[ \t]*)iput-boolean "
+            rf"(?P<value>[vp]\d+), (?P<object>[vp]\d+), "
+            rf"Lcom/bytedance/android/doubaoime/KeyboardJni\$SelectionUpdatedParams;"
+            rf"->{re.escape(field_name)}$",
+            re.MULTILINE,
+        )
+        match = pattern.search(smali)
+        if not match or len(pattern.findall(smali)) != 1:
+            print(f"    ✗ 字段 {field_name} 写入点数量不为 1")
+            return False
+        indent = match.group("indent")
+        value_reg = match.group("value")
+        object_reg = match.group("object")
+        replacement = (
+            f"{indent}invoke-static {{{value_reg}}}, {ASSOCIATION_PATCH_CLASS}"
+            f"->{helper_method}(Z)Z\n\n"
+            f"{indent}move-result {value_reg}\n\n"
+            f"{indent}iput-boolean {value_reg}, {object_reg}, "
+            "Lcom/bytedance/android/doubaoime/KeyboardJni$SelectionUpdatedParams;"
+            f"->{field_name}"
+        )
+        smali = pattern.sub(replacement, smali, count=1)
+        print(f"    ✓ 已过滤 {field_name}")
+
+    smali_path.write_text(smali, encoding="utf-8")
+    return True
+
+
+def patch_keyboard_preedit_behavior(smali_path):
+    """阻止英文标识符在数字/符号切换后重新进入 composing 状态。"""
+    print("  修补 KeyboardJni 英文 preedit 范围...")
+    smali = smali_path.read_text(encoding="utf-8")
+
+    track_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->trackEnglishPreedit(Ljava/lang/String;)V"""
+    smali = replace_method(
+        smali,
+        ".method public static UpdatePreedit(Ljava/lang/String;)V",
+        lambda method: insert_after_registers(method, track_snippet),
+    )
+
+    range_snippet = f"""    invoke-static {{v0, p0, p1}}, {ASSOCIATION_PATCH_CLASS}->suppressAsciiPreeditRange(Lcom/bytedance/android/input/editor/a;II)Z
+
+    move-result v1
+
+    if-eqz v1, :patch_ascii_preedit_continue
+
+    return-void
+
+    :patch_ascii_preedit_continue"""
+    smali = replace_method(
+        smali,
+        ".method public static SetPreeditRange(II)V",
+        lambda method: method.replace(
+            "    :cond_21\n",
+            "    :cond_21\n" + range_snippet + "\n\n",
+            1,
+        ),
+    )
+
+    finish_snippet = f"""    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->clearEnglishPreeditActive()V
+
+    invoke-static {{}}, Lcom/bytedance/android/doubaoime/KeyboardJni;->resetPreEditStartPosition()V"""
+    smali = replace_method(
+        smali,
+        ".method public static finishPreedit(Z)V",
+        lambda method: insert_after_registers(method, finish_snippet),
+    )
+
+    checks = {
+        "跟踪英文 preedit": "trackEnglishPreedit" in smali,
+        "过滤 ASCII preedit 范围": "patch_ascii_preedit_continue" in smali,
+        "结束时重置 preedit 起点": "clearEnglishPreeditActive" in smali,
+    }
+    for desc, ok in checks.items():
+        print(f"    [{'✓' if ok else '✗'}] {desc}")
+    if not all(checks.values()):
+        return False
+
+    smali_path.write_text(smali, encoding="utf-8")
+    return True
+
+
+def patch_association_fragment(smali_path):
+    """在智能联想页面程序化添加英文联想开关。"""
+    print("  修补 IntelligentAssociationFragment 设置页面...")
+    smali = smali_path.read_text(encoding="utf-8")
+    declaration = (
+        ".method public onViewCreated("
+        "Landroid/view/View;Landroid/os/Bundle;)V"
+    )
+    start, end = get_method_bounds(smali, declaration)
+    method = smali[start:end]
+    anchor = (
+        "    invoke-super {p0, p1, p2}, "
+        "Lcom/bytedance/android/input/fragment/settings/BaseSettingsFragment;"
+        "->onViewCreated(Landroid/view/View;Landroid/os/Bundle;)V\n"
+    )
+    if method.count(anchor) != 1:
+        print("    ✗ onViewCreated 锚点数量不为 1")
+        return False
+    addition = (
+        anchor
+        + "\n    invoke-static {p0, p1}, "
+        + ASSOCIATION_PATCH_CLASS
+        + "->attach(Lcom/bytedance/android/input/fragment/settings/"
+        "IntelligentAssociationFragment;Landroid/view/View;)V\n"
+    )
+    method = method.replace(anchor, addition, 1)
+    smali = smali[:start] + method + smali[end:]
+    smali_path.write_text(smali, encoding="utf-8")
+    print("    ✓ 已添加英文单词补全联想开关")
+    return True
+
+
+def patch_board_switch_preedit(smali_path):
+    """切换到数字或符号键盘前提交英文 composing 文本。"""
+    print("  修补英文 preedit 的数字/符号键盘切换...")
+    smali = smali_path.read_text(encoding="utf-8")
+    helper_call = (
+        "    invoke-static {}, "
+        f"{ASSOCIATION_PATCH_CLASS}->commitEnglishPreeditBeforeBoardSwitch()V\n\n"
+    )
+    anchors = [
+        (
+            "数字键盘",
+            "    const/4 v0, 0x5\n\n"
+            "    invoke-virtual {p1, v0}, "
+            "Lcom/bytedance/android/doubaoime/KeyboardJni;->switchKeyboard(I)V",
+        ),
+        (
+            "符号键盘",
+            "    invoke-virtual {p1, v1}, "
+            "Lcom/bytedance/android/doubaoime/KeyboardJni;->switchKeyboard(I)V",
+        ),
+    ]
+    for desc, anchor in anchors:
+        if smali.count(anchor) != 1:
+            print(f"    ✗ {desc} switchKeyboard 锚点数量不为 1")
+            return False
+        replacement = anchor.replace(
+            "    invoke-virtual",
+            helper_call + "    invoke-virtual",
+            1,
+        )
+        smali = smali.replace(anchor, replacement, 1)
+        print(f"    ✓ {desc}切换前提交英文 preedit")
+
+    smali_path.write_text(smali, encoding="utf-8")
+    return True
+
+
+def install_english_association_patch(classes_out):
+    """复制辅助类并修改设置、UI、光标联想三个入口。"""
+    print()
+    print("  安装英文单词补全联想设置补丁...")
+    template_dir = SCRIPT_DIR / "smali"
+    target_dir = (
+        classes_out
+        / "com/bytedance/android/input/fragment/settings"
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for filename in [
+        "EnglishAssociationPatch.smali",
+        "EnglishAssociationPatch$1.smali",
+    ]:
+        source = template_dir / filename
+        if not source.exists():
+            print(f"    ✗ 缺少补丁模板: {source}")
+            return False
+        shutil.copy2(source, target_dir / filename)
+        print(f"    ✓ 已复制 {filename}")
+
+    settings_path = classes_out / SMALI_SETTINGS_CONFIG
+    keyboard_jni_path = classes_out / SMALI_KEYBOARD_JNI
+    selection_path = classes_out / SMALI_KEYBOARD_SELECTION
+    board_switch_path = classes_out / SMALI_BOARD_SWITCH
+    fragment_path = classes_out / SMALI_ASSOCIATION_FRAGMENT
+    for path in [
+        settings_path,
+        keyboard_jni_path,
+        selection_path,
+        board_switch_path,
+        fragment_path,
+    ]:
+        if not path.exists():
+            print(f"    ✗ 找不到目标 Smali: {path}")
+            return False
+
+    return (
+        patch_settings_config(settings_path)
+        and patch_keyboard_preedit_behavior(keyboard_jni_path)
+        and patch_selection_association(selection_path)
+        and patch_board_switch_preedit(board_switch_path)
+        and patch_association_fragment(fragment_path)
+    )
 
 
 def find_qihei_loading_files(classes_out_dir):
@@ -47,7 +441,7 @@ def find_qihei_loading_files(classes_out_dir):
 
 
 def find_java():
-    java_path = shutil.which("java")
+    java_path = os.environ.get("JAVA") or shutil.which("java")
     if not java_path:
         for jdk in [
             r"C:\Program Files\Java\jdk-21.0.10\bin\java.exe",
@@ -59,6 +453,14 @@ def find_java():
 
 
 def find_apksigner():
+    configured = os.environ.get("APKSIGNER")
+    if configured and Path(configured).is_file():
+        return configured
+
+    on_path = shutil.which("apksigner") or shutil.which("apksigner.bat")
+    if on_path:
+        return on_path
+
     android_home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not android_home:
         for c in [
@@ -74,7 +476,10 @@ def find_apksigner():
     if android_home:
         build_tools = Path(android_home) / "build-tools"
         if build_tools.exists():
-            for v in sorted(build_tools.iterdir(), reverse=True):
+            def version_key(path):
+                return tuple(int(part) for part in re.findall(r"\d+", path.name))
+
+            for v in sorted(build_tools.iterdir(), key=version_key, reverse=True):
                 if not v.is_dir():
                     continue
                 apksigner = v / ("apksigner.bat" if os.name == "nt" else "apksigner")
@@ -122,6 +527,7 @@ def ensure_debug_keystore(keystore_path):
         "-keyalg", "RSA", "-keysize", "2048",
         "-validity", "10000",
         "-dname", "CN=Android Debug,O=Android,C=US",
+        "-noprompt",
     ], check=True)
     print(f"已创建 Debug 证书: {keystore_path}")
     return True
@@ -351,10 +757,9 @@ def build_apk(input_apk, output_apk, keystore_path):
 
     # 2. 工作目录
     print("[2/7] 创建工作目录...")
-    work_dir = Path(os.environ.get("TEMP", os.environ.get("TMPDIR", "/tmp"))) / "doubao_patch"
-    if work_dir.exists():
-        shutil.rmtree(work_dir)
-    work_dir.mkdir(parents=True)
+    temp_root = Path(os.environ.get("TEMP", os.environ.get("TMPDIR", tempfile.gettempdir())))
+    temp_root.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="doubao_patch_", dir=temp_root))
     print(f"  工作目录: {work_dir}")
 
     # 3. 提取 classes.dex
@@ -395,6 +800,10 @@ def build_apk(input_apk, output_apk, keystore_path):
             if not patch_qihei_direct_loads(f, desc):
                 print(f"警告：修补 {desc} 失败，继续构建")
 
+    if not install_english_association_patch(classes_out):
+        print("错误：英文单词补全联想补丁安装失败")
+        return False
+
     # 6. 汇编
     print("[6/7] 汇编 classes.dex...")
     dex_new_path = work_dir / "classes_new.dex"
@@ -424,7 +833,8 @@ def build_apk(input_apk, output_apk, keystore_path):
 
     # 签名
     print("  签名 APK...")
-    ensure_debug_keystore(keystore_path)
+    if not ensure_debug_keystore(keystore_path):
+        return False
 
     if apksigner:
         subprocess.run([
@@ -437,7 +847,10 @@ def build_apk(input_apk, output_apk, keystore_path):
             "--v3-signing-enabled", "true",
             str(patched_apk),
         ], check=True, capture_output=True)
-        print("  ✓ apksigner 签名完成（V1+V2+V3）")
+        subprocess.run([
+            apksigner, "verify", "--verbose", str(patched_apk),
+        ], check=True, capture_output=True)
+        print("  ✓ apksigner 签名及验证完成（V2/V3）")
     else:
         subprocess.run([
             jarsigner,

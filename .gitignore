@@ -32,6 +32,9 @@ tmp/
 # === Python ===
 __pycache__/
 *.pyc
+patch/.build-*/
+patch/doubao_patch_*/
+patch/.*-temp/
 
 # === 其他项目目录（不动） ===
 MonetPatch/

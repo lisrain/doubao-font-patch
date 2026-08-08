@@ -78,6 +78,20 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 
 这些位置的 `R.font.qihei` 加载被替换为 `Typeface.create("sans-serif", Typeface.NORMAL)`，使拼音显示区域也跟随系统字体。
 
+### 修改三：英文单词补全联想开关
+
+在“设置 → 智能联想”页面额外添加“英文单词补全联想”开关，默认开启。开关使用豆包原有的标准单行 `ImeListItemView` 设置项组件，复用原生标题、开关、15dp 圆角、主题背景和垂直居中布局，并使用 14dp 上下内边距与原页面相同的 `ime_dp_6`（6dp）卡片间距。
+
+关闭后，当输入法检测到当前为英文键盘时，补丁会同步关闭 native 引擎的 association 状态，并把光标更新参数中的 `SelectionUpdatedParams.need_association` 置为 `false`。这样既阻止光标停在不完整英文单词后自动触发补全联想，也避免 `claude-opus-` 一类已提交标识符在符号输入后重新作为整段候选出现并被重复追加。
+
+本功能使用纯 DEX/Smali 修改，不重新编译资源文件，配置键为 `english_word_association_enabled`，并复用 `SettingsConfigNext` 的设置进程与输入法进程同步链路。
+
+### 修改四：英文 composing 文本的数字/符号键盘切换提交
+
+英文输入过程中，当前单词可能以带下划线的 composing/preedit 文本存在。原逻辑切换到数字或符号键盘时直接调用 native `switchKeyboard(5/3)`，没有先调用 `finishComposingText()`，导致返回英文键盘后下一次字母输入会覆盖之前的整个组合单词。
+
+补丁在数字和符号键盘切换入口前增加提交逻辑，仅当当前是英文键盘且存在 preedit 时执行 `stopInputAndCommitPinyin()` 与 `finishPreedit(true)`，中文输入和无 composing 文本时保持原行为。同时跟踪英文 `UpdatePreedit()` 状态，在关闭英文联想开关时拦截 ASCII 字母、数字、连字符、下划线和点号组成的 `SetPreeditRange()`，并清理 `preEditStartPosition`，避免 `claude-opus` 等连续标识符在切换数字键盘后重新变成整段可覆盖的下划线编辑区。
+
 ## 修改方式
 
 ### 方案：Smali 级别修改（仅改 DEX）
@@ -91,6 +105,11 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 | `KeyboardView.smali` | `createTypeFace()` 方法：保留图标字体，其余用系统字体 |
 | 候选栏内部类（自动检测） | qihei → 系统字体 |
 | `MoreCandidateSyllableAdapter.smali` | 音节列表 qihei → 系统字体 |
+| `SettingsConfigNext.smali` | 注册并同步英文单词补全配置 |
+| `KeyboardJni$1.smali` | 过滤英文光标联想参数 |
+| `IntelligentAssociationFragment.smali` | 挂载英文联想开关 |
+| `InputViewRoot$F.smali` | 数字/符号键盘切换前提交英文 composing 文本 |
+| `EnglishAssociationPatch*.smali` | 配置读取、UI 监听和过滤逻辑 |
 
 **自动检测**：脚本通过搜索 `0x7f090003`（R.font.qihei）+ `ResourcesCompat;->getFont` 模式自动定位所有需要修补的文件，无需硬编码内部类名，兼容所有版本。
 
@@ -113,7 +132,7 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 ## 工具依赖
 
 - Java 8+
-- [baksmali.jar](https://github.com/baksmali/smali/releases) / [smali.jar](https://github.com/baksmali/smali/releases)（v3.0.9）
+- [baksmali.jar](https://github.com/JesusFreke/smali) / [smali.jar](https://github.com/JesusFreke/smali)（仓库内固定为 v2.5.2，并由 CI 校验 SHA-256）
 - **apksigner**（Android SDK Build Tools 自带，优先使用）
   - 没有 apksigner 时回退到 jarsigner（仅 V1 签名）
   - V1 签名在 Android 7.0+ 上可能安装失败，可用 MT 管理器重新签名
@@ -123,10 +142,10 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 
 ```bash
 # CI/跨平台版（推荐）
-python ci-patch.py <原版.apk> <输出.apk>
+uv run --python 3.12 ci-patch.py <原版.apk> <输出.apk>
 
 # 指定 keystore
-python ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
+uv run --python 3.12 ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
 ```
 
 ## 注意事项
@@ -134,5 +153,5 @@ python ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
 1. **必须用原版 APK 为基础**，不要用任何已经修改过的版本
 2. 构建时跳过 META-INF（旧签名）和旧的 classes.dex，其他文件原样保留
 3. 签名使用 Android Debug 证书，如果不存在脚本会自动创建
-4. 优先使用 apksigner 签名（V1+V2+V3），兼容 Android 7.0+ 设备
+4. 优先使用 apksigner 签名并验证 V2/V3，兼容 Android 7.0+ 设备
 5. 候选栏内部类名在版本间会变化（如 `$h` → `$i`），脚本通过资源 ID 自动检测，无需手动更新
