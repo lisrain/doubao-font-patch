@@ -35,6 +35,8 @@ __pycache__/
 patch/.build-*/
 patch/doubao_patch_*/
 patch/.*-temp/
+patch/baksmali.jar
+patch/smali.jar
 
 # === 其他项目目录（不动） ===
 MonetPatch/

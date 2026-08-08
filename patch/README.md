@@ -132,7 +132,7 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 ## 工具依赖
 
 - Java 8+
-- [baksmali.jar](https://github.com/JesusFreke/smali) / [smali.jar](https://github.com/JesusFreke/smali)（仓库内固定为 v2.5.2，并由 CI 校验 SHA-256）
+- [baksmali.jar](https://github.com/baksmali/smali/releases) / [smali.jar](https://github.com/baksmali/smali/releases)（CI 动态下载官方 v3.0.9 `fat-release` JAR，校验 SHA-256 后在临时目录中使用，构建结束即丢弃）
 - **apksigner**（Android SDK Build Tools 自带，优先使用）
   - 没有 apksigner 时回退到 jarsigner（仅 V1 签名）
   - V1 签名在 Android 7.0+ 上可能安装失败，可用 MT 管理器重新签名

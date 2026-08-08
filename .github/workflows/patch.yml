@@ -34,8 +34,9 @@ env:
   API_URL: https://shurufa.doubao.com/api/v1/app/download_url?platform=android
   PATCH_REVISION: "2"
   ANDROID_BUILD_TOOLS: "35.0.0"
-  BAKSMALI_SHA256: d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5
-  SMALI_SHA256: 9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116
+  SMALI_VERSION: "3.0.9"
+  BAKSMALI_SHA256: 1b206070701b2145bd1e6204abd6c14fea877f335486845cd4df149bf5f79c2e
+  SMALI_SHA256: b5e2aa019c49ddaf7b2cace80f60ebbfd61f7ac18e7a3dea1075bec8779cc37a
 
 jobs:
   metadata:
@@ -145,13 +146,25 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Verify bundled smali tools
+      - name: Download smali tools
         run: |
           set -euo pipefail
-          echo "$BAKSMALI_SHA256  patch/baksmali.jar" | sha256sum --check --strict
-          echo "$SMALI_SHA256  patch/smali.jar" | sha256sum --check --strict
-          java -jar patch/baksmali.jar --version
-          java -jar patch/smali.jar --version
+          tool_dir="$RUNNER_TEMP/smali-tools"
+          mkdir -p "$tool_dir"
+
+          curl --fail --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output "$tool_dir/baksmali.jar" \
+            "https://github.com/baksmali/smali/releases/download/${SMALI_VERSION}/baksmali-${SMALI_VERSION}-fat-release.jar"
+          curl --fail --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output "$tool_dir/smali.jar" \
+            "https://github.com/baksmali/smali/releases/download/${SMALI_VERSION}/smali-${SMALI_VERSION}-fat-release.jar"
+
+          echo "$BAKSMALI_SHA256  $tool_dir/baksmali.jar" | sha256sum --check --strict
+          echo "$SMALI_SHA256  $tool_dir/smali.jar" | sha256sum --check --strict
+          java -jar "$tool_dir/baksmali.jar" --version
+          java -jar "$tool_dir/smali.jar" --version
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4.0.1
@@ -199,8 +212,8 @@ jobs:
 
       - name: Patch and sign APK
         env:
-          BAKSMALI_JAR: ${{ github.workspace }}/patch/baksmali.jar
-          SMALI_JAR: ${{ github.workspace }}/patch/smali.jar
+          BAKSMALI_JAR: ${{ runner.temp }}/smali-tools/baksmali.jar
+          SMALI_JAR: ${{ runner.temp }}/smali-tools/smali.jar
         run: |
           set -euo pipefail
           export APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
