@@ -28,9 +28,7 @@ SMALI_KEYBOARD_VIEW = "com/bytedance/android/input/keyboard/KeyboardView.smali"
 SMALI_SETTINGS_CONFIG = "com/bytedance/android/input/common/SettingsConfigNext.smali"
 SMALI_KEYBOARD_JNI = "com/bytedance/android/doubaoime/KeyboardJni.smali"
 SMALI_KEYBOARD_SELECTION = "com/bytedance/android/doubaoime/KeyboardJni$1.smali"
-SMALI_BOARD_SWITCH = (
-    "com/bytedance/android/input/keyboard/areacontrol/InputViewRoot$F.smali"
-)
+SMALI_BOARD_SWITCH_DIR = "com/bytedance/android/input/keyboard/areacontrol"
 SMALI_ASSOCIATION_FRAGMENT = (
     "com/bytedance/android/input/fragment/settings/"
     "IntelligentAssociationFragment.smali"
@@ -38,6 +36,9 @@ SMALI_ASSOCIATION_FRAGMENT = (
 ASSOCIATION_PATCH_CLASS = (
     "Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;"
 )
+DEX_METHOD_LIMIT = 65535
+PRIMARY_DEX_MIGRATION_THRESHOLD = 65520
+DEX_MIGRATION_CLASS = "J/N.smali"
 
 # R.font.qihei 的资源 ID
 QIHEI_FONT_RES_ID = "0x7f090003"
@@ -45,6 +46,38 @@ QIHEI_FONT_RES_ID = "0x7f090003"
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
 KEY_PASS = "android"
+
+
+def read_dex_id_sizes(dex_data):
+    """读取 DEX 头部的主要 ID 表数量。"""
+    if len(dex_data) < 0x70 or not dex_data.startswith(b"dex\n"):
+        raise ValueError("无效的 DEX 文件")
+
+    def uint32(offset):
+        return int.from_bytes(dex_data[offset:offset + 4], "little")
+
+    return {
+        "strings": uint32(0x38),
+        "types": uint32(0x40),
+        "protos": uint32(0x48),
+        "fields": uint32(0x50),
+        "methods": uint32(0x58),
+        "classes": uint32(0x60),
+    }
+
+
+def select_helper_dex(dex_entries):
+    """选择 method_ids 余量最大的次 DEX 存放辅助类。"""
+    candidates = []
+    for name, data in dex_entries.items():
+        if name == "classes.dex":
+            continue
+        sizes = read_dex_id_sizes(data)
+        candidates.append((sizes["methods"], name, sizes))
+    if not candidates:
+        raise ValueError("APK 不含次 DEX，无法安全安装英文联想辅助类")
+    _, name, sizes = min(candidates)
+    return name, sizes
 
 
 def get_method_bounds(smali, declaration):
@@ -71,6 +104,17 @@ def replace_method(smali, declaration, transform):
     if new_method == old_method:
         raise ValueError(f"方法未发生修改: {declaration}")
     return smali[:start] + new_method + smali[end:]
+
+
+def replace_method_candidates(smali, declarations, transform, description):
+    """从多个版本的方法签名中选择唯一存在的一项并转换。"""
+    matches = [declaration for declaration in declarations if declaration in smali]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{description} 方法签名匹配数量异常: {len(matches)}，候选={declarations}"
+        )
+    print(f"    ✓ {description}: {matches[0]}")
+    return replace_method(smali, matches[0], transform)
 
 
 def patch_settings_config(smali_path):
@@ -145,10 +189,14 @@ def patch_settings_config(smali_path):
     return-void
 
     :patch_assoc_set_object_continue"""
-    smali = replace_method(
+    smali = replace_method_candidates(
         smali,
-        ".method public static final o(Ljava/lang/String;Ljava/lang/Object;)V",
+        [
+            ".method public static final o(Ljava/lang/String;Ljava/lang/Object;)V",
+            ".method public static final p(Ljava/lang/String;Ljava/lang/Object;)V",
+        ],
         lambda method: insert_after_registers(method, set_object_snippet),
+        "设置进程写入",
     )
 
     set_string_snippet = f"""    invoke-static {{p1}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
@@ -162,10 +210,14 @@ def patch_settings_config(smali_path):
     return-void
 
     :patch_assoc_set_string_continue"""
-    smali = replace_method(
+    smali = replace_method_candidates(
         smali,
-        ".method public final m(Ljava/lang/String;Ljava/lang/String;)V",
+        [
+            ".method public final m(Ljava/lang/String;Ljava/lang/String;)V",
+            ".method public final o(Ljava/lang/String;Ljava/lang/String;)V",
+        ],
         lambda method: insert_after_registers(method, set_string_snippet),
+        "输入法进程写入",
     )
 
     known_key_old = """    move-result p1
@@ -377,13 +429,32 @@ def patch_board_switch_preedit(smali_path):
     return True
 
 
-def install_english_association_patch(classes_out):
+def find_board_switch_smali(classes_out):
+    """定位同时处理数字与符号键盘切换的 InputViewRoot 内部类。"""
+    search_dir = classes_out / SMALI_BOARD_SWITCH_DIR
+    matches = []
+    for path in search_dir.glob("InputViewRoot$*.smali"):
+        content = path.read_text(encoding="utf-8")
+        if (
+            "InputBoardType;->kNumber" in content
+            and "InputBoardType;->kSymbol" in content
+            and content.count("->switchKeyboard(I)V") >= 2
+        ):
+            matches.append(path)
+    if len(matches) != 1:
+        print(f"    ✗ 数字/符号键盘切换类匹配数量异常: {len(matches)}")
+        return None
+    print(f"    ✓ 数字/符号键盘切换类: {matches[0].name}")
+    return matches[0]
+
+
+def install_english_association_patch(classes_out, helper_classes_out):
     """复制辅助类并修改设置、UI、光标联想三个入口。"""
     print()
     print("  安装英文单词补全联想设置补丁...")
     template_dir = SCRIPT_DIR / "smali"
     target_dir = (
-        classes_out
+        helper_classes_out
         / "com/bytedance/android/input/fragment/settings"
     )
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -401,8 +472,10 @@ def install_english_association_patch(classes_out):
     settings_path = classes_out / SMALI_SETTINGS_CONFIG
     keyboard_jni_path = classes_out / SMALI_KEYBOARD_JNI
     selection_path = classes_out / SMALI_KEYBOARD_SELECTION
-    board_switch_path = classes_out / SMALI_BOARD_SWITCH
+    board_switch_path = find_board_switch_smali(classes_out)
     fragment_path = classes_out / SMALI_ASSOCIATION_FRAGMENT
+    if board_switch_path is None:
+        return False
     for path in [
         settings_path,
         keyboard_jni_path,
@@ -421,6 +494,22 @@ def install_english_association_patch(classes_out):
         and patch_board_switch_preedit(board_switch_path)
         and patch_association_fragment(fragment_path)
     )
+
+
+def migrate_primary_class(classes_out, helper_classes_out, relative_path):
+    """将仅由次 DEX 使用的类迁出主 DEX，以释放 method_ids。"""
+    source = classes_out / relative_path
+    target = helper_classes_out / relative_path
+    if not source.exists():
+        print(f"    ✗ 找不到可迁移类: {source}")
+        return False
+    if target.exists():
+        print(f"    ✗ 目标 DEX 已包含同名类: {target}")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(target))
+    print(f"    ✓ 已将 {relative_path} 迁移到辅助 DEX")
+    return True
 
 
 def find_qihei_loading_files(classes_out_dir):
@@ -762,22 +851,44 @@ def build_apk(input_apk, output_apk, keystore_path):
     work_dir = Path(tempfile.mkdtemp(prefix="doubao_patch_", dir=temp_root))
     print(f"  工作目录: {work_dir}")
 
-    # 3. 提取 classes.dex
-    print("[3/7] 提取 classes.dex...")
+    # 3. 提取全部 DEX
+    print("[3/7] 提取 DEX...")
     with zipfile.ZipFile(input_apk) as z:
-        dex_data = z.read("classes.dex")
-        dex_path = work_dir / "classes.dex"
-        dex_path.write_bytes(dex_data)
-    print(f"  MD5: {hashlib.md5(dex_data).hexdigest()} ({len(dex_data)} bytes)")
+        dex_names = sorted(
+            name for name in z.namelist()
+            if re.fullmatch(r"classes(?:\d+)?\.dex", name)
+        )
+        dex_entries = {name: z.read(name) for name in dex_names}
+        dex_data = dex_entries["classes.dex"]
+        dex_paths = {}
+        for name, data in dex_entries.items():
+            dex_paths[name] = work_dir / name
+            dex_paths[name].write_bytes(data)
+        helper_dex_name, _ = select_helper_dex(dex_entries)
+    primary_dex_sizes = read_dex_id_sizes(dex_data)
+    for name, data in dex_entries.items():
+        sizes = read_dex_id_sizes(data)
+        suffix = "，辅助类目标" if name == helper_dex_name else ""
+        print(
+            f"  {name}: MD5={hashlib.md5(data).hexdigest()}, "
+            f"methods={sizes['methods']}/{DEX_METHOD_LIMIT}, "
+            f"size={len(data)}{suffix}"
+        )
 
     # 4. 反编译
-    print("[4/7] 反编译 classes.dex...")
-    classes_out = work_dir / "classes_out"
-    subprocess.run(
-        [java, "-jar", str(baksmali_jar),
-         "disassemble", str(dex_path), "-o", str(classes_out)],
-        check=True, capture_output=True,
-    )
+    print(f"[4/7] 反编译 {len(dex_entries)} 个 DEX...")
+    dex_out_dirs = {}
+    for name, dex_path in dex_paths.items():
+        out_dir = work_dir / f"{Path(name).stem}_out"
+        subprocess.run(
+            [java, "-jar", str(baksmali_jar),
+             "disassemble", str(dex_path), "-o", str(out_dir)],
+            check=True, capture_output=True,
+        )
+        dex_out_dirs[name] = out_dir
+        print(f"  ✓ {name}")
+    classes_out = dex_out_dirs["classes.dex"]
+    helper_classes_out = dex_out_dirs[helper_dex_name]
 
     # 5. 打补丁
     print("[5/7] 修改 smali 文件...")
@@ -791,7 +902,9 @@ def build_apk(input_apk, output_apk, keystore_path):
     # 修补候选栏拼音显示区域的字体（自动检测）
     print()
     print("  修补候选栏拼音显示区域字体（自动检测）...")
-    qihei_files = find_qihei_loading_files(classes_out)
+    qihei_files = []
+    for out_dir in dex_out_dirs.values():
+        qihei_files.extend(find_qihei_loading_files(out_dir))
     if not qihei_files:
         print("  ⚠ 未找到候选栏 qihei 加载文件")
     else:
@@ -800,23 +913,41 @@ def build_apk(input_apk, output_apk, keystore_path):
             if not patch_qihei_direct_loads(f, desc):
                 print(f"警告：修补 {desc} 失败，继续构建")
 
-    if not install_english_association_patch(classes_out):
+    if primary_dex_sizes["methods"] >= PRIMARY_DEX_MIGRATION_THRESHOLD:
+        print()
+        print("  主 DEX method_ids 接近上限，迁移 native 桥接类释放空间...")
+        if not migrate_primary_class(
+            classes_out, helper_classes_out, DEX_MIGRATION_CLASS
+        ):
+            return False
+
+    if not install_english_association_patch(classes_out, helper_classes_out):
         print("错误：英文单词补全联想补丁安装失败")
         return False
 
     # 6. 汇编
-    print("[6/7] 汇编 classes.dex...")
-    dex_new_path = work_dir / "classes_new.dex"
-    subprocess.run(
-        [java, "-jar", str(smali_jar),
-         "assemble", str(classes_out), "-o", str(dex_new_path)],
-        check=True, capture_output=True,
-    )
-    dex_new_size = dex_new_path.stat().st_size
-    print(f"  DEX 大小: {dex_new_size} bytes (原始: {len(dex_data)})")
-    if dex_new_size < 1000000:
-        print(f"错误：新的 DEX 太小 ({dex_new_size})")
-        return False
+    print(f"[6/7] 汇编 {len(dex_entries)} 个 DEX...")
+    dex_new_paths = {}
+    for name, out_dir in dex_out_dirs.items():
+        dex_new_path = work_dir / f"{Path(name).stem}_new.dex"
+        subprocess.run(
+            [java, "-jar", str(smali_jar),
+             "assemble", str(out_dir), "-o", str(dex_new_path)],
+            check=True, capture_output=True,
+        )
+        dex_new_paths[name] = dex_new_path
+        dex_new_size = dex_new_path.stat().st_size
+        print(
+            f"  {name}: {dex_new_size} bytes "
+            f"(原始: {len(dex_entries[name])})"
+        )
+        minimum_size = max(65536, len(dex_entries[name]) // 2)
+        if dex_new_size < minimum_size:
+            print(
+                f"错误：新的 {name} 太小 ({dex_new_size}，"
+                f"最低预期 {minimum_size})"
+            )
+            return False
 
     # 7. 构建 APK
     print("[7/7] 构建 APK...")
@@ -826,10 +957,11 @@ def build_apk(input_apk, output_apk, keystore_path):
             for item in zin.infolist():
                 if item.filename.startswith("META-INF/"):
                     continue
-                if item.filename == "classes.dex":
+                if item.filename in dex_new_paths:
                     continue
                 zout.writestr(item, zin.read(item.filename))
-            zout.write(dex_new_path, "classes.dex")
+            for name, dex_new_path in dex_new_paths.items():
+                zout.write(dex_new_path, name)
 
     # 签名
     print("  签名 APK...")

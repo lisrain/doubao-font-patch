@@ -32,7 +32,6 @@ concurrency:
 
 env:
   API_URL: https://shurufa.doubao.com/api/v1/app/download_url?platform=android
-  PATCH_REVISION: "2"
   ANDROID_BUILD_TOOLS: "35.0.0"
   SMALI_VERSION: "3.0.9"
   BAKSMALI_SHA256: 1b206070701b2145bd1e6204abd6c14fea877f335486845cd4df149bf5f79c2e
@@ -78,7 +77,7 @@ jobs:
           version_code="$(jq -r '.data.version_code' "$response_file")"
           url="$(jq -r '.data.url' "$response_file")"
           filename="$(basename "${url%%\?*}")"
-          tag="v${version}-patch${PATCH_REVISION}"
+          tag="v${version}"
 
           exists=false
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
@@ -277,6 +276,6 @@ jobs:
             "${{ needs.build.outputs.output_file }}" \
             "${{ needs.build.outputs.output_file }}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "豆包输入法 ${{ needs.metadata.outputs.version }} 补丁版（patch ${{ env.PATCH_REVISION }}）" \
+            --title "豆包输入法 ${{ needs.metadata.outputs.version }} 补丁版" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest

@@ -96,7 +96,7 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 
 ### 方案：Smali 级别修改（仅改 DEX）
 
-使用 **baksmali → smali** 工具链，只修改 `classes.dex` 中的 smali 文件，完全不触碰 APK 中的任何资源文件（图片、XML 等）。
+使用 **baksmali → smali** 工具链，只修改 APK 的 DEX 文件，完全不触碰任何资源文件（图片、XML 等）。脚本会扫描并重组全部 `classes*.dex`，以兼容 1.4.0 将候选栏相关类迁移到 `classes2.dex` 的变化。
 
 修改的 smali 文件：
 
@@ -108,10 +108,12 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 | `SettingsConfigNext.smali` | 注册并同步英文单词补全配置 |
 | `KeyboardJni$1.smali` | 过滤英文光标联想参数 |
 | `IntelligentAssociationFragment.smali` | 挂载英文联想开关 |
-| `InputViewRoot$F.smali` | 数字/符号键盘切换前提交英文 composing 文本 |
+| `InputViewRoot` 内部类（自动检测） | 数字/符号键盘切换前提交英文 composing 文本 |
 | `EnglishAssociationPatch*.smali` | 配置读取、UI 监听和过滤逻辑 |
 
 **自动检测**：脚本通过搜索 `0x7f090003`（R.font.qihei）+ `ResourcesCompat;->getFont` 模式自动定位所有需要修补的文件，无需硬编码内部类名，兼容所有版本。
+
+豆包输入法 1.4.0 的主 DEX 已达到 65534/65535 个 `method_ids`。脚本会把补丁辅助类放入余量最大的次 DEX；主 DEX 接近上限时，还会把仅由第三 DEX 调用的 Chromium native 桥接类 `J/N` 一并迁移到辅助 DEX，从而避免 Smali 汇编溢出。1.3.17 主 DEX 余量充足时不会执行该迁移。
 
 ### 为什么不用 apktool
 
@@ -120,13 +122,14 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 ## 构建流程
 
 ```
-1. 从原版 APK 提取 classes.dex
-2. baksmali 反编译 classes.dex → smali 文件
+1. 从原版 APK 提取全部 classes*.dex
+2. baksmali 反编译全部 DEX → smali 文件
 3. 修改 KeyboardView.smali 中的 createTypeFace 方法
 4. 自动检测并修补所有 qihei 加载点
-5. smali 汇编回 classes.dex
-6. 用 ZIP 工具替换原版 APK 中的 classes.dex（去掉旧 META-INF）
-7. 签名（V1+V2+V3 或 jarsigner V1）
+5. 将英文联想辅助类放入 method_ids 余量最大的次 DEX
+6. smali 分别汇编全部 DEX
+7. 用 ZIP 工具替换原版 APK 中的全部 DEX（去掉旧 META-INF）
+8. 签名（V1+V2+V3 或 jarsigner V1）
 ```
 
 ## 工具依赖
@@ -142,16 +145,16 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 
 ```bash
 # CI/跨平台版（推荐）
-uv run --python 3.12 ci-patch.py <原版.apk> <输出.apk>
+uv run --python 3.12 patch/ci-patch.py <原版.apk> <输出.apk>
 
 # 指定 keystore
-uv run --python 3.12 ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
+uv run --python 3.12 patch/ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
 ```
 
 ## 注意事项
 
 1. **必须用原版 APK 为基础**，不要用任何已经修改过的版本
-2. 构建时跳过 META-INF（旧签名）和旧的 classes.dex，其他文件原样保留
+2. 构建时跳过 META-INF（旧签名）和旧的 classes*.dex，其他文件原样保留
 3. 签名使用 Android Debug 证书，如果不存在脚本会自动创建
 4. 优先使用 apksigner 签名并验证 V2/V3，兼容 Android 7.0+ 设备
 5. 候选栏内部类名在版本间会变化（如 `$h` → `$i`），脚本通过资源 ID 自动检测，无需手动更新
