@@ -23,115 +23,6 @@
     invoke-static {p0, p1}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->attachStyled(Lcom/bytedance/android/input/fragment/settings/IntelligentAssociationFragment;Landroid/view/View;)V
 
     return-void
-
-    if-eqz p1, :return
-
-    instance-of v0, p1, Landroid/view/ViewGroup;
-
-    if-eqz v0, :return
-
-    move-object v0, p1
-
-    check-cast v0, Landroid/view/ViewGroup;
-
-    const-string v1, "english_word_association_enabled"
-
-    invoke-virtual {v0, v1}, Landroid/view/ViewGroup;->findViewWithTag(Ljava/lang/Object;)Landroid/view/View;
-
-    move-result-object v2
-
-    if-nez v2, :return
-
-    const/4 v2, 0x1
-
-    invoke-virtual {v0, v2}, Landroid/view/ViewGroup;->getChildAt(I)Landroid/view/View;
-
-    move-result-object v0
-
-    instance-of v2, v0, Landroid/view/ViewGroup;
-
-    if-eqz v2, :return
-
-    check-cast v0, Landroid/view/ViewGroup;
-
-    const/4 v2, 0x0
-
-    invoke-virtual {v0, v2}, Landroid/view/ViewGroup;->getChildAt(I)Landroid/view/View;
-
-    move-result-object v0
-
-    instance-of v3, v0, Landroid/view/ViewGroup;
-
-    if-eqz v3, :return
-
-    check-cast v0, Landroid/view/ViewGroup;
-
-    new-instance v3, Landroidx/appcompat/widget/SwitchCompat;
-
-    invoke-virtual {p1}, Landroid/view/View;->getContext()Landroid/content/Context;
-
-    move-result-object p0
-
-    invoke-direct {v3, p0}, Landroidx/appcompat/widget/SwitchCompat;-><init>(Landroid/content/Context;)V
-
-    invoke-virtual {v3, v1}, Landroid/view/View;->setTag(Ljava/lang/Object;)V
-
-    const-string v1, "英文单词补全联想"
-
-    invoke-virtual {v3, v1}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V
-
-    const/high16 v1, 0x41800000    # 16.0f
-
-    invoke-virtual {v3, v1}, Landroid/widget/TextView;->setTextSize(F)V
-
-    const/16 v1, 0x10
-
-    invoke-virtual {v3, v1}, Landroid/widget/TextView;->setGravity(I)V
-
-    invoke-static {}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->isEnabled()Z
-
-    move-result v1
-
-    invoke-virtual {v3, v1}, Landroidx/appcompat/widget/SwitchCompat;->setChecked(Z)V
-
-    new-instance v1, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch$1;
-
-    invoke-direct {v1, v3}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch$1;-><init>(Landroidx/appcompat/widget/SwitchCompat;)V
-
-    invoke-virtual {v3, v1}, Landroid/view/View;->setOnClickListener(Landroid/view/View$OnClickListener;)V
-
-    invoke-virtual {p1}, Landroid/view/View;->getResources()Landroid/content/res/Resources;
-
-    move-result-object p0
-
-    invoke-virtual {p0}, Landroid/content/res/Resources;->getDisplayMetrics()Landroid/util/DisplayMetrics;
-
-    move-result-object p0
-
-    iget p0, p0, Landroid/util/DisplayMetrics;->density:F
-
-    const/high16 v1, 0x41800000    # 16.0f
-
-    mul-float p0, p0, v1
-
-    float-to-int p0, p0
-
-    invoke-virtual {v3, v2, p0, v2, p0}, Landroid/view/View;->setPadding(IIII)V
-
-    new-instance p0, Landroid/widget/LinearLayout$LayoutParams;
-
-    const/4 p1, -0x1
-
-    const/4 v1, -0x2
-
-    invoke-direct {p0, p1, v1}, Landroid/widget/LinearLayout$LayoutParams;-><init>(II)V
-
-    invoke-virtual {v3, p0}, Landroid/view/View;->setLayoutParams(Landroid/view/ViewGroup$LayoutParams;)V
-
-    invoke-virtual {v0, v3}, Landroid/view/ViewGroup;->addView(Landroid/view/View;)V
-
-    :return
-    return-void
 .end method
 .method public static attachStyled(Lcom/bytedance/android/input/fragment/settings/IntelligentAssociationFragment;Landroid/view/View;)V
     .registers 9
@@ -167,6 +58,7 @@
     const v5, 0x7f0a0363
     invoke-virtual {v3, v5}, Landroid/view/View;->findViewById(I)Landroid/view/View;
     move-result-object v5
+    if-eqz v5, :return
     check-cast v5, Landroid/widget/TextView;
     const-string v1, "英文单词补全联想"
     invoke-virtual {v5, v1}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V
@@ -190,6 +82,7 @@
     const v5, 0x7f0a0629
     invoke-virtual {v3, v5}, Landroid/view/View;->findViewById(I)Landroid/view/View;
     move-result-object v5
+    if-eqz v5, :return
     invoke-virtual {v5}, Landroid/view/View;->getPaddingLeft()I
     move-result v6
     invoke-virtual {v5}, Landroid/view/View;->getPaddingRight()I
@@ -204,11 +97,13 @@
     const v5, 0x7f0a0347
     invoke-virtual {v3, v5}, Landroid/view/View;->findViewById(I)Landroid/view/View;
     move-result-object v5
+    if-eqz v5, :return
     const/4 v1, 0x0
     invoke-virtual {v5, v1}, Landroid/view/View;->setVisibility(I)V
 
     invoke-virtual {v3}, Lcom/bytedance/common_biz/ui/widget/ImeListItemView;->a()Landroidx/appcompat/widget/SwitchCompat;
     move-result-object v4
+    if-eqz v4, :return
     invoke-virtual {v4, v1}, Landroid/view/View;->setVisibility(I)V
     invoke-virtual {v4, v1}, Landroid/view/View;->setHapticFeedbackEnabled(Z)V
     invoke-static {}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->isEnabled()Z

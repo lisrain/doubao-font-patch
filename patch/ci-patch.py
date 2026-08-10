@@ -17,6 +17,7 @@ import hashlib
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,115 @@ QIHEI_FONT_RES_ID = "0x7f090003"
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
 KEY_PASS = "android"
+
+# EnglishAssociationPatch.smali 模板中的资源 ID 占位值（1.3.17 的原始 ID）。
+# 构建时会解析输入 APK 的 resources.arsc，按资源名替换为当前版本的真实 ID。
+ASSOCIATION_RES_ID_NAMES = {
+    "0x7f0a0363": "id/item_title",
+    "0x7f0a0629": "id/text_container",
+    "0x7f0a0347": "id/item_accessory_container",
+    "0x7f0703c3": "dimen/ime_dp_15",
+    "0x7f0703b8": "dimen/ime_dp_14",
+    "0x7f070491": "dimen/ime_dp_6",
+    "0x7f060253": "color/ime_color_setting_item_bg",
+}
+
+
+def parse_string_pool(data, offset):
+    """解析 ResStringPool 块，返回字符串列表。"""
+    pool_type, header_size, _size, string_count, _style_count, flags, strings_start, _styles_start = (
+        struct.unpack_from("<HHIIIIII", data, offset)
+    )
+    if pool_type != 0x0001:
+        raise ValueError(f"无效的字符串池块类型: 0x{pool_type:04x}")
+    utf8 = bool(flags & 0x100)
+    offsets_base = offset + header_size
+    strings_base = offset + strings_start
+    strings = []
+    for index in range(string_count):
+        string_offset = struct.unpack_from("<I", data, offsets_base + index * 4)[0]
+        pos = strings_base + string_offset
+        if utf8:
+            char_count = data[pos]
+            pos += 2 if char_count & 0x80 else 1
+            byte_count = data[pos]
+            if byte_count & 0x80:
+                byte_count = ((byte_count & 0x7F) << 8) | data[pos + 1]
+                pos += 2
+            else:
+                pos += 1
+            strings.append(data[pos:pos + byte_count].decode("utf-8"))
+        else:
+            char_count = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            if char_count & 0x8000:
+                char_count = ((char_count & 0x7FFF) << 16) | struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+            strings.append(data[pos:pos + char_count * 2].decode("utf-16-le"))
+    return strings
+
+
+def parse_resource_ids(arsc_data):
+    """解析 resources.arsc，返回 {"类型/名称": 资源 ID} 映射。"""
+    table_type, header_size, _size = struct.unpack_from("<HHI", arsc_data, 0)
+    if table_type != 0x0002:
+        raise ValueError("无效的 resources.arsc 头部")
+    package_count = struct.unpack_from("<I", arsc_data, 8)[0]
+    resources = {}
+    offset = header_size
+    # 跳过全局字符串池
+    _t, _h, global_pool_size = struct.unpack_from("<HHI", arsc_data, offset)
+    offset += global_pool_size
+    for _ in range(package_count):
+        chunk_type, chunk_header_size, chunk_size = struct.unpack_from("<HHI", arsc_data, offset)
+        if chunk_type != 0x0200:
+            offset += chunk_size
+            continue
+        package_id = struct.unpack_from("<I", arsc_data, offset + 8)[0]
+        type_strings_offset, _last_public_type, key_strings_offset = struct.unpack_from(
+            "<III", arsc_data, offset + 12 + 256
+        )
+        type_names = parse_string_pool(arsc_data, offset + type_strings_offset)
+        key_names = parse_string_pool(arsc_data, offset + key_strings_offset)
+        cursor = offset + chunk_header_size
+        chunk_end = offset + chunk_size
+        while cursor < chunk_end:
+            inner_type, inner_header_size, inner_size = struct.unpack_from("<HHI", arsc_data, cursor)
+            if inner_type == 0x0201:  # RES_TABLE_TYPE_TYPE
+                type_id = arsc_data[cursor + 8]
+                type_flags = arsc_data[cursor + 9]
+                entry_count = struct.unpack_from("<I", arsc_data, cursor + 12)[0]
+                entries_start = struct.unpack_from("<I", arsc_data, cursor + 16)[0]
+                if type_flags != 0:
+                    raise ValueError(f"不支持的 type 块 flags: {type_flags}")
+                type_name = type_names[type_id - 1]
+                for entry_index in range(entry_count):
+                    entry_offset = struct.unpack_from(
+                        "<I", arsc_data, cursor + inner_header_size + entry_index * 4
+                    )[0]
+                    if entry_offset == 0xFFFFFFFF:
+                        continue
+                    entry_pos = cursor + entries_start + entry_offset
+                    key_index = struct.unpack_from("<I", arsc_data, entry_pos + 4)[0]
+                    resource_id = (package_id << 24) | (type_id << 16) | entry_index
+                    key = f"{type_name}/{key_names[key_index]}"
+                    resources.setdefault(key, resource_id)
+            cursor += inner_size
+        offset += chunk_size
+    return resources
+
+
+def resolve_association_resource_ids(input_apk):
+    """解析输入 APK 的资源表，返回模板占位 ID → 当前版本真实 ID 的替换映射。"""
+    with zipfile.ZipFile(input_apk) as archive:
+        arsc_data = archive.read("resources.arsc")
+    resources = parse_resource_ids(arsc_data)
+    replacements = {}
+    for placeholder, resource_name in ASSOCIATION_RES_ID_NAMES.items():
+        if resource_name not in resources:
+            raise ValueError(f"输入 APK 缺少资源: {resource_name}")
+        replacements[placeholder] = f"0x{resources[resource_name]:08x}"
+    return replacements
 
 
 def read_dex_id_sizes(dex_data):
@@ -117,7 +227,65 @@ def replace_method_candidates(smali, declarations, transform, description):
     return replace_method(smali, matches[0], transform)
 
 
-def patch_settings_config(smali_path):
+def detect_settings_sync_methods(settings_smali_path, keyboard_jni_path):
+    """探测 SettingsConfigNext 的写入入口、设置进程写入者与输入法进程写入方法。
+
+    - 写入入口：static (String,Object)V 方法，方法体通过 {p0, p1} 委托给同签名写入者
+    - 设置进程写入者：写入入口的委托目标（补丁 hook 点）
+    - 输入法进程写入者：KeyboardJni.updateSettingsStringValue 调用的
+      SettingsConfigNext.(String,String)V 实例方法（补丁 hook 点）
+
+    返回 (entry, settings_writer, ime_writer)，探测失败的位置为 None。
+    """
+    settings_smali = settings_smali_path.read_text(encoding="utf-8")
+    entries = []
+    for match in re.finditer(
+        r"\.method public static final (\w+)\(Ljava/lang/String;Ljava/lang/Object;\)V\n"
+        r"(.*?)\n\.end method",
+        settings_smali,
+        re.DOTALL,
+    ):
+        delegate = re.search(
+            r"invoke-static \{p0, p1\}, "
+            r"Lcom/bytedance/android/input/common/SettingsConfigNext;->"
+            r"(\w+)\(Ljava/lang/String;Ljava/lang/Object;\)V",
+            match.group(2),
+        )
+        if delegate:
+            entries.append((match.group(1), delegate.group(1)))
+    entry = settings_writer = None
+    if len(entries) == 1:
+        entry, settings_writer = entries[0]
+        print(f"    ✓ 设置写入入口: {entry} → 写入者 {settings_writer}")
+    else:
+        print(f"    ⚠ 设置写入入口探测异常: {entries}")
+
+    ime_writer = None
+    keyboard_smali = keyboard_jni_path.read_text(encoding="utf-8")
+    sync_match = re.search(
+        r"\.method public static updateSettingsStringValue"
+        r"\(Ljava/lang/String;Ljava/lang/String;\)V\n"
+        r"(.*?)\n\.end method",
+        keyboard_smali,
+        re.DOTALL,
+    )
+    if sync_match:
+        target = re.search(
+            r"invoke-virtual \{[vp]\d+, p0, p1\}, "
+            r"Lcom/bytedance/android/input/common/SettingsConfigNext;->"
+            r"(\w+)\(Ljava/lang/String;Ljava/lang/String;\)V",
+            sync_match.group(1),
+        )
+        if target:
+            ime_writer = target.group(1)
+    if ime_writer:
+        print(f"    ✓ 输入法进程写入方法: {ime_writer}")
+    else:
+        print("    ⚠ 输入法进程写入方法探测失败，回退候选签名")
+    return entry, settings_writer, ime_writer
+
+
+def patch_settings_config(smali_path, settings_writer=None, ime_writer=None):
     """让自定义布尔配置复用原有 SettingsConfigNext 跨进程同步链路。"""
     print("  修补 SettingsConfigNext 自定义配置支持...")
     smali = smali_path.read_text(encoding="utf-8")
@@ -189,12 +357,19 @@ def patch_settings_config(smali_path):
     return-void
 
     :patch_assoc_set_object_continue"""
-    smali = replace_method_candidates(
-        smali,
-        [
+    if settings_writer:
+        set_object_declarations = [
+            f".method public static final {settings_writer}"
+            "(Ljava/lang/String;Ljava/lang/Object;)V"
+        ]
+    else:
+        set_object_declarations = [
             ".method public static final o(Ljava/lang/String;Ljava/lang/Object;)V",
             ".method public static final p(Ljava/lang/String;Ljava/lang/Object;)V",
-        ],
+        ]
+    smali = replace_method_candidates(
+        smali,
+        set_object_declarations,
         lambda method: insert_after_registers(method, set_object_snippet),
         "设置进程写入",
     )
@@ -210,12 +385,18 @@ def patch_settings_config(smali_path):
     return-void
 
     :patch_assoc_set_string_continue"""
-    smali = replace_method_candidates(
-        smali,
-        [
+    if ime_writer:
+        set_string_declarations = [
+            f".method public final {ime_writer}(Ljava/lang/String;Ljava/lang/String;)V"
+        ]
+    else:
+        set_string_declarations = [
             ".method public final m(Ljava/lang/String;Ljava/lang/String;)V",
             ".method public final o(Ljava/lang/String;Ljava/lang/String;)V",
-        ],
+        ]
+    smali = replace_method_candidates(
+        smali,
+        set_string_declarations,
         lambda method: insert_after_registers(method, set_string_snippet),
         "输入法进程写入",
     )
@@ -448,7 +629,7 @@ def find_board_switch_smali(classes_out):
     return matches[0]
 
 
-def install_english_association_patch(classes_out, helper_classes_out):
+def install_english_association_patch(classes_out, helper_classes_out, resource_ids):
     """复制辅助类并修改设置、UI、光标联想三个入口。"""
     print()
     print("  安装英文单词补全联想设置补丁...")
@@ -487,8 +668,41 @@ def install_english_association_patch(classes_out, helper_classes_out):
             print(f"    ✗ 找不到目标 Smali: {path}")
             return False
 
+    association_patch_path = target_dir / "EnglishAssociationPatch.smali"
+    association_smali = association_patch_path.read_text(encoding="utf-8")
+    for placeholder, resolved in resource_ids.items():
+        if placeholder not in association_smali:
+            print(f"    ✗ 模板缺少占位资源 ID: {placeholder}")
+            return False
+        association_smali = association_smali.replace(placeholder, resolved)
+        print(f"    ✓ 资源 ID {placeholder} → {resolved}")
+    association_patch_path.write_text(association_smali, encoding="utf-8")
+
+    entry, settings_writer, ime_writer = detect_settings_sync_methods(
+        settings_path, keyboard_jni_path
+    )
+    if entry is None:
+        print("    ✗ 无法确定设置写入入口，拒绝构建")
+        return False
+    listener_path = target_dir / "EnglishAssociationPatch$1.smali"
+    listener_smali = listener_path.read_text(encoding="utf-8")
+    listener_target = (
+        "Lcom/bytedance/android/input/common/SettingsConfigNext;->"
+        "l(Ljava/lang/String;Ljava/lang/Object;)V"
+    )
+    if listener_target not in listener_smali:
+        print("    ✗ 监听器模板缺少 SettingsConfigNext 调用占位")
+        return False
+    listener_smali = listener_smali.replace(
+        listener_target,
+        "Lcom/bytedance/android/input/common/SettingsConfigNext;->"
+        f"{entry}(Ljava/lang/String;Ljava/lang/Object;)V",
+    )
+    listener_path.write_text(listener_smali, encoding="utf-8")
+    print(f"    ✓ 监听器写入入口回填为 {entry}")
+
     return (
-        patch_settings_config(settings_path)
+        patch_settings_config(settings_path, settings_writer, ime_writer)
         and patch_keyboard_preedit_behavior(keyboard_jni_path)
         and patch_selection_association(selection_path)
         and patch_board_switch_preedit(board_switch_path)
@@ -865,6 +1079,13 @@ def build_apk(input_apk, output_apk, keystore_path):
             dex_paths[name] = work_dir / name
             dex_paths[name].write_bytes(data)
         helper_dex_name, _ = select_helper_dex(dex_entries)
+
+    try:
+        association_resource_ids = resolve_association_resource_ids(input_apk)
+    except Exception as exc:
+        print(f"错误：解析 resources.arsc 失败: {exc}")
+        return False
+    print("  ✓ 已解析英文联想开关所需资源 ID")
     primary_dex_sizes = read_dex_id_sizes(dex_data)
     for name, data in dex_entries.items():
         sizes = read_dex_id_sizes(data)
@@ -921,7 +1142,9 @@ def build_apk(input_apk, output_apk, keystore_path):
         ):
             return False
 
-    if not install_english_association_patch(classes_out, helper_classes_out):
+    if not install_english_association_patch(
+        classes_out, helper_classes_out, association_resource_ids
+    ):
         print("错误：英文单词补全联想补丁安装失败")
         return False
 

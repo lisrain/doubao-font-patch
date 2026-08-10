@@ -86,6 +86,10 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 
 本功能使用纯 DEX/Smali 修改，不重新编译资源文件，配置键为 `english_word_association_enabled`，并复用 `SettingsConfigNext` 的设置进程与输入法进程同步链路。
 
+`ImeListItemView` 内部视图 ID、圆角/内边距 dimen 与卡片背景色在不同版本间会整体漂移（1.3.17 → 1.4.0 全部变化，直接导致进入智能联想页面 NPE 闪退）。因此模板 smali 中只保留占位 ID，构建时由脚本解析输入 APK 的 `resources.arsc`，按资源名（`id/item_title`、`id/text_container`、`id/item_accessory_container`、`dimen/ime_dp_15`、`dimen/ime_dp_14`、`dimen/ime_dp_6`、`color/ime_color_setting_item_bg`）动态解析真实 ID 回填，并对所有 `findViewById` 结果做空保护，任何一步找不到视图时静默跳过、不再闪退。
+
+`SettingsConfigNext` 的混淆方法名同样会漂移（1.3.17 的写入入口 `l` / 写入者 `o` / 输入法进程写入 `m`，在 1.4.0 变为 `m` / `p` / `n`）。构建时脚本自动探测三个角色：写入入口为通过 `{p0, p1}` 委托同类 `(String,Object)V` 方法的静态方法；输入法进程写入者从 `KeyboardJni.updateSettingsStringValue` 实际调用的 `(String,String)V` 实例方法提取。开关监听器调用写入入口，两个 hook 点分别落在写入者与输入法进程写入者上。
+
 ### 修改四：英文 composing 文本的数字/符号键盘切换提交
 
 英文输入过程中，当前单词可能以带下划线的 composing/preedit 文本存在。原逻辑切换到数字或符号键盘时直接调用 native `switchKeyboard(5/3)`，没有先调用 `finishComposingText()`，导致返回英文键盘后下一次字母输入会覆盖之前的整个组合单词。
@@ -105,11 +109,11 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 | `KeyboardView.smali` | `createTypeFace()` 方法：保留图标字体，其余用系统字体 |
 | 候选栏内部类（自动检测） | qihei → 系统字体 |
 | `MoreCandidateSyllableAdapter.smali` | 音节列表 qihei → 系统字体 |
-| `SettingsConfigNext.smali` | 注册并同步英文单词补全配置 |
+| `SettingsConfigNext.smali` | 注册并同步英文单词补全配置（写入方法自动探测） |
 | `KeyboardJni$1.smali` | 过滤英文光标联想参数 |
 | `IntelligentAssociationFragment.smali` | 挂载英文联想开关 |
 | `InputViewRoot` 内部类（自动检测） | 数字/符号键盘切换前提交英文 composing 文本 |
-| `EnglishAssociationPatch*.smali` | 配置读取、UI 监听和过滤逻辑 |
+| `EnglishAssociationPatch*.smali` | 配置读取、UI 监听和过滤逻辑（资源 ID 构建时动态解析） |
 
 **自动检测**：脚本通过搜索 `0x7f090003`（R.font.qihei）+ `ResourcesCompat;->getFont` 模式自动定位所有需要修补的文件，无需硬编码内部类名，兼容所有版本。
 
@@ -158,3 +162,4 @@ uv run --python 3.12 patch/ci-patch.py <原版.apk> <输出.apk> --keystore /pat
 3. 签名使用 Android Debug 证书，如果不存在脚本会自动创建
 4. 优先使用 apksigner 签名并验证 V2/V3，兼容 Android 7.0+ 设备
 5. 候选栏内部类名在版本间会变化（如 `$h` → `$i`），脚本通过资源 ID 自动检测，无需手动更新
+6. 英文联想开关依赖的视图/dimen/颜色资源 ID 与 `SettingsConfigNext` 混淆方法名在版本间会漂移，脚本在构建时解析 `resources.arsc` 与 smali 结构自动适配，无需手动更新
