@@ -73,7 +73,12 @@ jobs:
             exit 1
           fi
 
-          version="$(jq -r '.data.version_name | sub("^[vV]"; "")' "$response_file")"
+          raw_version="$(jq -r '.data.version_name' "$response_file")"
+          version="${raw_version#[vV]}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "官方版本格式不符合 x.xx.x: $raw_version" >&2
+            exit 1
+          fi
           version_code="$(jq -r '.data.version_code' "$response_file")"
           url="$(jq -r '.data.url' "$response_file")"
           filename="$(basename "${url%%\?*}")"
