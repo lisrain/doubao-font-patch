@@ -263,24 +263,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
-          ## 修改内容
+          version="${{ needs.metadata.outputs.version }}"
+          version_code="${{ needs.metadata.outputs.version_code }}"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## v${version} - 补丁版
 
-          - 将 qihei、misans 等非图标字体替换为系统字体
-          - 保留 oimeui2023、oimeui2025 图标字体及皮肤 `.ttf` 字体
-          - 在“设置 → 智能联想”中加入“英文单词补全联想”开关，默认开启
+          基于官方 v${version} (version_code: ${version_code}) 打补丁。
+
+          ### 修改内容
+
+          - 移除 \`updateIsSupportSystemFont()\` 调用
+          - 将所有非图标字体（qihei、misans 等）替换为系统字体 (\`Typeface.create\`)
+          - 保留图标字体 (oimeui2023/oimeui2025) 和皮肤字体 (.ttf)
+          - 在“设置 → 智能联想”中新增“英文单词补全联想”开关，默认开启
           - 关闭开关后禁用英文 native association，并阻止光标触发单词补全
-          - 修复 `claude-opus-4` 等英文标识符切换数字/符号键盘后被覆盖或整段候选重复追加
+          - 修复 \`claude-opus-4\` 等英文标识符切换数字/符号键盘后被覆盖或整段候选重复追加
 
-          ## 签名
+          ### 签名
 
-          APK 已通过 `apksigner verify` 的 V2/V3 签名验证，附件同时提供 SHA-256 文件。
+          使用 Android Debug 证书签名（V1+V2+V3），可直接安装，附件同时提供 SHA-256 文件。
+
+          > 如安装失败，请用 MT 管理器等工具重新签名后安装。
           EOF
 
           gh release create "${{ needs.metadata.outputs.tag }}" \
             "${{ needs.build.outputs.output_file }}" \
             "${{ needs.build.outputs.output_file }}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "豆包输入法 ${{ needs.metadata.outputs.version }} 补丁版" \
+            --title "${{ needs.metadata.outputs.tag }} 补丁版" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest
