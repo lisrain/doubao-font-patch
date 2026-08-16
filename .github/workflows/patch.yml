@@ -130,6 +130,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.names.outputs.artifact_name }}
       output_file: ${{ steps.names.outputs.output_file }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -234,6 +235,7 @@ jobs:
           sha256sum "${{ steps.names.outputs.output_file }}" | tee "${{ steps.names.outputs.output_file }}.sha256"
 
       - name: Upload artifact
+        id: upload
         uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ steps.names.outputs.artifact_name }}
@@ -241,7 +243,9 @@ jobs:
             ${{ steps.names.outputs.output_file }}
             ${{ steps.names.outputs.output_file }}.sha256
           if-no-files-found: error
-          retention-days: 90
+          # 发布流程只把 artifact 当 build → release 的中转，产物最终落在 Release
+          # 附件（不计入 Actions storage 配额）；push/PR 的测试构建保留 3 天备查。
+          retention-days: ${{ needs.metadata.outputs.should_release == 'true' && 1 || 3 }}
 
   release:
     needs: [metadata, build]
@@ -249,6 +253,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -293,3 +298,19 @@ jobs:
             --title "${{ needs.metadata.outputs.tag }} 补丁版" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest
+
+      - name: Delete transit artifact
+        # Release 附件已是永久副本，中转 artifact 立即回收以免占用 Actions storage 配额。
+        # 仅在发布成功后执行：发布失败时 artifact 是唯一产物副本，必须留着。
+        # 删除失败不让已成功的发布变红，最坏情况下由 retention-days 兜底。
+        if: needs.build.outputs.artifact_id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          gh api -X DELETE \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            && echo "已删除中转 artifact #${ARTIFACT_ID}" \
+            || echo "删除中转 artifact #${ARTIFACT_ID} 失败，将由 retention-days 过期回收"
