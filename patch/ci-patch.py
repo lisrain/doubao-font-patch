@@ -1424,7 +1424,7 @@ def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
     variants = [("仅特性版", output_apk, {})]
     if icon_replacements is not None:
         icons_output_apk = output_apk.with_name(
-            f"{output_apk.stem}_icons{output_apk.suffix}"
+            f"{output_apk.stem}-icons{output_apk.suffix}"
         )
         icon_overrides = dict(icon_replacements)
         if patched_arsc is not None:
