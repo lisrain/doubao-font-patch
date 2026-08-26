@@ -10,6 +10,8 @@
   4. 开关关闭时，英文键盘光标更新不再请求单词补全联想
   5. 关闭开关时，英文 ASCII 标识符不因 SetPreeditRange 重新进入可覆盖编辑状态
   6. 数字/符号键盘切换前提交英文 composing 文本
+  7. 可选替换 launcher 图标（--icon-dir，默认仓库 Android/ 目录），
+     同时导出两个 APK：仅特性版、特性+图标版
 """
 
 import argparse
@@ -43,6 +45,14 @@ DEX_MIGRATION_CLASS = "J/N.smali"
 
 # R.font.qihei 的资源 ID
 QIHEI_FONT_RES_ID = "0x7f090003"
+
+DEFAULT_ICON_DIR = SCRIPT_DIR.parent / "Android"
+EXPECTED_ICON_SIZES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+ICON_DPI_RANK = {
+    "ldpi": 120, "mdpi": 160, "hdpi": 240,
+    "xhdpi": 320, "xxhdpi": 480, "xxxhdpi": 640,
+    "nodpi": 0xFFFE, "anydpi": -1,
+}
 
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
@@ -156,6 +166,168 @@ def resolve_association_resource_ids(input_apk):
             raise ValueError(f"输入 APK 缺少资源: {resource_name}")
         replacements[placeholder] = f"0x{resources[resource_name]:08x}"
     return replacements
+
+
+def parse_string_pool_raw(data, offset):
+    """解析 ResStringPool，返回按索引排列的字符串（容忍非 UTF-8 脏数据）。"""
+    pool_type, header_size, _size, string_count, _style_count, flags, strings_start, _styles_start = (
+        struct.unpack_from("<HHIIIIII", data, offset)
+    )
+    if pool_type != 0x0001:
+        raise ValueError(f"无效的字符串池块类型: 0x{pool_type:04x}")
+    utf8 = bool(flags & 0x100)
+    offsets_base = offset + header_size
+    strings_base = offset + strings_start
+    strings = []
+    for index in range(string_count):
+        string_offset = struct.unpack_from("<I", data, offsets_base + index * 4)[0]
+        pos = strings_base + string_offset
+        if utf8:
+            char_count = data[pos]
+            pos += 2 if char_count & 0x80 else 1
+            byte_count = data[pos]
+            if byte_count & 0x80:
+                byte_count = ((byte_count & 0x7F) << 8) | data[pos + 1]
+                pos += 2
+            else:
+                pos += 1
+            strings.append(data[pos:pos + byte_count].decode("utf-8", "replace"))
+        else:
+            char_count = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            if char_count & 0x8000:
+                char_count = ((char_count & 0x7FFF) << 16) | struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+            strings.append(
+                bytes(data[pos:pos + char_count * 2]).decode("utf-16-le", "replace")
+            )
+    return strings
+
+
+def read_png_size(data):
+    """读取 PNG IHDR 宽高，非 PNG 返回 None。"""
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack_from(">II", data, 16)
+    return None
+
+
+def pick_best_launcher_png(strings_raw, key):
+    """在 arsc 全局字符串池中为指定图标名挑选密度最高的 PNG 路径。"""
+    prefix = "res/mipmap-"
+    suffix = f"/{key}.png"
+    best_index = best_rank = None
+    for index, path in enumerate(strings_raw):
+        if not (path.startswith(prefix) and path.endswith(suffix)):
+            continue
+        qualifier = path[len(prefix):len(path) - len(suffix)]
+        dpi = re.sub(r"-v\d+$", "", qualifier)
+        rank = ICON_DPI_RANK.get(dpi, -1)
+        if best_rank is None or rank > best_rank:
+            best_index, best_rank = index, rank
+    return best_index
+
+
+def retarget_adaptive_icon_entries(arsc_data, icon_keys):
+    """
+    将 mipmap/ic_launcher* 在 anydpi-v26 配置下指向 .xml 的条目，
+    原地重定向到字符串池中已有的最高密度 PNG 路径，
+    使 Android 8.0+ 设备使用替换后的普通 PNG 图标而非原自适应图标。
+    仅修改 entry 的字符串索引（4 字节），块大小不变。
+    """
+    data = bytearray(arsc_data)
+    table_type, header_size, _size = struct.unpack_from("<HHI", data, 0)
+    if table_type != 0x0002:
+        raise ValueError("无效的 resources.arsc 头部")
+    package_count = struct.unpack_from("<I", data, 8)[0]
+    offset = header_size
+    _t, _h, global_pool_size = struct.unpack_from("<HHI", data, offset)
+    strings_raw = parse_string_pool_raw(data, offset)
+    offset += global_pool_size
+
+    retargeted = []
+    for _ in range(package_count):
+        chunk_type, chunk_header_size, chunk_size = struct.unpack_from("<HHI", data, offset)
+        if chunk_type != 0x0200:
+            offset += chunk_size
+            continue
+        type_strings_offset, _last_public_type, key_strings_offset = struct.unpack_from(
+            "<III", data, offset + 12 + 256
+        )
+        type_names = parse_string_pool_raw(data, offset + type_strings_offset)
+        key_names = parse_string_pool_raw(data, offset + key_strings_offset)
+        cursor = offset + chunk_header_size
+        chunk_end = offset + chunk_size
+        while cursor < chunk_end:
+            inner_type, inner_header_size, inner_size = struct.unpack_from("<HHI", data, cursor)
+            if inner_type == 0x0201 and type_names[data[cursor + 8] - 1] == "mipmap":
+                entry_count = struct.unpack_from("<I", data, cursor + 12)[0]
+                entries_start = struct.unpack_from("<I", data, cursor + 16)[0]
+                for entry_index in range(entry_count):
+                    entry_offset = struct.unpack_from(
+                        "<I", data, cursor + inner_header_size + entry_index * 4
+                    )[0]
+                    if entry_offset == 0xFFFFFFFF:
+                        continue
+                    entry_pos = cursor + entries_start + entry_offset
+                    flags = struct.unpack_from("<H", data, entry_pos + 2)[0]
+                    if flags & 0x0001:
+                        continue
+                    key = key_names[struct.unpack_from("<I", data, entry_pos + 4)[0]]
+                    if key not in icon_keys:
+                        continue
+                    value_pos = entry_pos + 8
+                    if data[value_pos + 3] != 0x03:
+                        continue
+                    old_index = struct.unpack_from("<I", data, value_pos + 4)[0]
+                    old_path = strings_raw[old_index]
+                    if not old_path.endswith(".xml"):
+                        continue
+                    new_index = pick_best_launcher_png(strings_raw, key)
+                    if new_index is None:
+                        raise ValueError(f"字符串池中找不到 {key} 的 PNG 路径")
+                    struct.pack_into("<I", data, value_pos + 4, new_index)
+                    retargeted.append((key, old_path, strings_raw[new_index]))
+            cursor += inner_size
+        offset += chunk_size
+
+    return bytes(data), retargeted
+
+
+def collect_icon_replacements(zip_names, icon_dir):
+    """
+    收集图标目录中的 launcher PNG，映射到 APK 内实际路径。
+    返回 (zip 内容替换映射, 需要自适应图标重定向的资源名集合)。
+    """
+    available = set(zip_names)
+    replacements = {}
+    redirect_keys = set()
+    for dpi_dir in sorted(
+        p for p in Path(icon_dir).iterdir()
+        if p.is_dir() and p.name.startswith("mipmap-")
+    ):
+        dpi = dpi_dir.name[len("mipmap-"):]
+        expected_size = EXPECTED_ICON_SIZES.get(dpi)
+        for png in sorted(dpi_dir.glob("*.png")):
+            key = png.stem
+            matches = [
+                name for name in sorted(available)
+                if re.fullmatch(rf"res/mipmap-{dpi}(?:-[a-z0-9]+)*/{re.escape(png.name)}", name)
+            ]
+            if len(matches) != 1:
+                print(f"  - 跳过 {png.relative_to(icon_dir)}: APK 内匹配到 {len(matches)} 个路径")
+                continue
+            zip_path = matches[0]
+            data = png.read_bytes()
+            size = read_png_size(data)
+            if size and expected_size and size != (expected_size, expected_size):
+                print(
+                    f"  ⚠ {png.name} 尺寸 {size[0]}x{size[1]} "
+                    f"与 {dpi} 标准 {expected_size}x{expected_size} 不符，继续使用"
+                )
+            replacements[zip_path] = data
+            redirect_keys.add(key)
+            print(f"  ✓ {zip_path} ← {png.name} ({len(data)} bytes)")
+    return replacements, redirect_keys
 
 
 def read_dex_id_sizes(dex_data):
@@ -1012,7 +1184,59 @@ def patch_qihei_direct_loads(smali_path, description):
     return True
 
 
-def build_apk(input_apk, output_apk, keystore_path):
+def write_patched_apk(dest_path, input_apk, dex_new_paths, file_overrides):
+    """按原 ZIP 条目顺序重建 APK，替换 DEX 与指定资源内容，剥离旧签名。"""
+    with zipfile.ZipFile(input_apk, "r") as zin:
+        with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename.startswith("META-INF/"):
+                    continue
+                if item.filename in dex_new_paths:
+                    continue
+                if item.filename in file_overrides:
+                    zout.writestr(item, file_overrides[item.filename])
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+            for name, dex_new_path in dex_new_paths.items():
+                zout.write(dex_new_path, name)
+
+
+def sign_apk(apk_path, keystore_path, apksigner, jarsigner):
+    """对 APK 做 debug 签名并校验。"""
+    print(f"  签名 {Path(apk_path).name}...")
+    if not ensure_debug_keystore(keystore_path):
+        return False
+    if apksigner:
+        subprocess.run([
+            apksigner, "sign",
+            "--ks", str(keystore_path),
+            "--ks-pass", f"pass:{KEYSTORE_PASS}",
+            "--ks-key-alias", KEY_ALIAS,
+            "--v1-signing-enabled", "true",
+            "--v2-signing-enabled", "true",
+            "--v3-signing-enabled", "true",
+            str(apk_path),
+        ], check=True, capture_output=True)
+        subprocess.run([
+            apksigner, "verify", "--verbose", str(apk_path),
+        ], check=True, capture_output=True)
+        print("  ✓ apksigner 签名及验证完成（V1/V2/V3）")
+    else:
+        subprocess.run([
+            jarsigner,
+            "-keystore", str(keystore_path),
+            "-storepass", KEYSTORE_PASS,
+            "-keypass", KEY_PASS,
+            "-sigalg", "SHA256withRSA",
+            "-digestalg", "SHA-256",
+            str(apk_path),
+            KEY_ALIAS,
+        ], check=True, capture_output=True)
+        print("  ✓ jarsigner 签名完成（仅 V1）")
+    return True
+
+
+def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
     print("=" * 60)
     print("豆包输入法 系统字体补丁")
     print("=" * 60)
@@ -1096,6 +1320,29 @@ def build_apk(input_apk, output_apk, keystore_path):
             f"size={len(data)}{suffix}"
         )
 
+    # 图标替换准备
+    icon_replacements = None
+    patched_arsc = None
+    if icon_dir is not None:
+        print()
+        print("  准备图标替换...")
+        print(f"  图标目录: {icon_dir}")
+        with zipfile.ZipFile(input_apk) as archive:
+            zip_names = archive.namelist()
+            original_arsc = archive.read("resources.arsc")
+        icon_replacements, redirect_keys = collect_icon_replacements(zip_names, icon_dir)
+        if not icon_replacements:
+            print("  ⚠ 未收集到任何图标，本次仅输出特性版")
+            icon_replacements = None
+        else:
+            patched_arsc, retargeted = retarget_adaptive_icon_entries(
+                original_arsc, redirect_keys
+            )
+            for key, old_path, new_path in retargeted:
+                print(f"  ✓ 自适应图标重定向 {key}: {old_path} → {new_path}")
+            if not retargeted:
+                print("  ⚠ 未发现 v26 自适应图标定义，跳过 resources.arsc 重定向")
+
     # 4. 反编译
     print(f"[4/7] 反编译 {len(dex_entries)} 个 DEX...")
     dex_out_dirs = {}
@@ -1174,60 +1421,32 @@ def build_apk(input_apk, output_apk, keystore_path):
 
     # 7. 构建 APK
     print("[7/7] 构建 APK...")
-    patched_apk = work_dir / "patched.apk"
-    with zipfile.ZipFile(input_apk, "r") as zin:
-        with zipfile.ZipFile(patched_apk, "w", zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                if item.filename.startswith("META-INF/"):
-                    continue
-                if item.filename in dex_new_paths:
-                    continue
-                zout.writestr(item, zin.read(item.filename))
-            for name, dex_new_path in dex_new_paths.items():
-                zout.write(dex_new_path, name)
+    variants = [("仅特性版", output_apk, {})]
+    if icon_replacements is not None:
+        icons_output_apk = output_apk.with_name(
+            f"{output_apk.stem}_icons{output_apk.suffix}"
+        )
+        icon_overrides = dict(icon_replacements)
+        if patched_arsc is not None:
+            icon_overrides["resources.arsc"] = patched_arsc
+        variants.append(("特性+图标版", icons_output_apk, icon_overrides))
 
-    # 签名
-    print("  签名 APK...")
-    if not ensure_debug_keystore(keystore_path):
-        return False
-
-    if apksigner:
-        subprocess.run([
-            apksigner, "sign",
-            "--ks", str(keystore_path),
-            "--ks-pass", f"pass:{KEYSTORE_PASS}",
-            "--ks-key-alias", KEY_ALIAS,
-            "--v1-signing-enabled", "true",
-            "--v2-signing-enabled", "true",
-            "--v3-signing-enabled", "true",
-            str(patched_apk),
-        ], check=True, capture_output=True)
-        subprocess.run([
-            apksigner, "verify", "--verbose", str(patched_apk),
-        ], check=True, capture_output=True)
-        print("  ✓ apksigner 签名及验证完成（V2/V3）")
-    else:
-        subprocess.run([
-            jarsigner,
-            "-keystore", str(keystore_path),
-            "-storepass", KEYSTORE_PASS,
-            "-keypass", KEY_PASS,
-            "-sigalg", "SHA256withRSA",
-            "-digestalg", "SHA-256",
-            str(patched_apk),
-            KEY_ALIAS,
-        ], check=True, capture_output=True)
-        print("  ✓ jarsigner 签名完成（仅 V1）")
-
-    output_apk.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(patched_apk, output_apk)
-    out_size = output_apk.stat().st_size
-    print(f"  输出: {output_apk} ({out_size / 1024 / 1024:.1f} MB)")
+    for variant_name, variant_output, file_overrides in variants:
+        print(f"  --- {variant_name} ---")
+        patched_apk = work_dir / variant_output.name
+        write_patched_apk(patched_apk, input_apk, dex_new_paths, file_overrides)
+        if not sign_apk(patched_apk, keystore_path, apksigner, jarsigner):
+            return False
+        variant_output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(patched_apk, variant_output)
+        out_size = variant_output.stat().st_size
+        print(f"  输出: {variant_output} ({out_size / 1024 / 1024:.1f} MB)")
 
     print()
     print("=" * 60)
     print("完成！")
-    print(f"APK 已生成: {output_apk}")
+    for _label, variant_output, _overrides in variants:
+        print(f"APK 已生成: {variant_output}")
     print("=" * 60)
     return True
 
@@ -1238,7 +1457,19 @@ if __name__ == "__main__":
     parser.add_argument("output_apk", help="输出 APK 路径")
     parser.add_argument("--keystore", default=str(Path.home() / ".android" / "debug.keystore"),
                         help="签名 keystore 路径")
+    parser.add_argument("--icon-dir", default=str(DEFAULT_ICON_DIR),
+                        help=f"launcher 图标目录（默认 {DEFAULT_ICON_DIR}）")
+    parser.add_argument("--no-icons", action="store_true",
+                        help="禁用图标替换，仅输出特性版")
     args = parser.parse_args()
 
-    ok = build_apk(args.input_apk, args.output_apk, args.keystore)
+    icon_dir = None
+    if not args.no_icons:
+        candidate = Path(args.icon_dir)
+        if candidate.is_dir():
+            icon_dir = candidate
+        else:
+            print(f"提示: 图标目录不存在，仅输出特性版: {candidate}")
+
+    ok = build_apk(args.input_apk, args.output_apk, args.keystore, icon_dir=icon_dir)
     sys.exit(0 if ok else 1)

@@ -1,5 +1,6 @@
 # === APK 文件（大二进制，不入仓） ===
 *.apk
+out/
 
 # === 本地构建/脚本（CI 不需要） ===
 patch/build.bat
@@ -37,6 +38,9 @@ patch/doubao_patch_*/
 patch/.*-temp/
 patch/baksmali.jar
 patch/smali.jar
+
+# === 图标产物（CI 从 logo@300.png 实时生成，用完即弃） ===
+Android/
 
 # === 其他项目目录（不动） ===
 MonetPatch/

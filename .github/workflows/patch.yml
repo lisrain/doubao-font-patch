@@ -130,6 +130,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.names.outputs.artifact_name }}
       output_file: ${{ steps.names.outputs.output_file }}
+      icons_output_file: ${{ steps.names.outputs.icons_output_file }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
@@ -211,9 +212,16 @@ jobs:
         id: names
         run: |
           output_file="doubaoime-${{ needs.metadata.outputs.version }}-fontpatch-association.apk"
+          icons_output_file="doubaoime-${{ needs.metadata.outputs.version }}-fontpatch-association-icons.apk"
           artifact_name="doubaoime-${{ needs.metadata.outputs.version }}-patched"
           echo "output_file=$output_file" >> "$GITHUB_OUTPUT"
+          echo "icons_output_file=$icons_output_file" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Generate launcher icons
+        run: |
+          set -euo pipefail
+          uv run --python 3.12 --with Pillow patch/gen-icons.py logo@300.png Android
 
       - name: Patch and sign APK
         env:
@@ -231,8 +239,10 @@ jobs:
         run: |
           set -euo pipefail
           APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
-          "$APKSIGNER" verify --verbose --print-certs "${{ steps.names.outputs.output_file }}"
-          sha256sum "${{ steps.names.outputs.output_file }}" | tee "${{ steps.names.outputs.output_file }}.sha256"
+          for f in "${{ steps.names.outputs.output_file }}" "${{ steps.names.outputs.icons_output_file }}"; do
+            "$APKSIGNER" verify --verbose --print-certs "$f"
+            sha256sum "$f" | tee "$f.sha256"
+          done
 
       - name: Upload artifact
         id: upload
@@ -242,6 +252,8 @@ jobs:
           path: |
             ${{ steps.names.outputs.output_file }}
             ${{ steps.names.outputs.output_file }}.sha256
+            ${{ steps.names.outputs.icons_output_file }}
+            ${{ steps.names.outputs.icons_output_file }}.sha256
           if-no-files-found: error
           # 发布流程只把 artifact 当 build → release 的中转，产物最终落在 Release
           # 附件（不计入 Actions storage 配额）；push/PR 的测试构建保留 3 天备查。
@@ -282,7 +294,8 @@ jobs:
           - 保留图标字体 (oimeui2023/oimeui2025) 和皮肤字体 (.ttf)
           - 在“设置 → 智能联想”中新增“英文单词补全联想”开关，默认开启
           - 关闭开关后禁用英文 native association，并阻止光标触发单词补全
-          - 修复 \`claude-opus-4\` 等英文标识符切换数字/符号键盘后被覆盖或整段候选重复追加
+          - 修复 `claude-opus-4` 等英文标识符切换数字/符号键盘后被覆盖或整段候选重复追加
+          - 新增图标版（-icons.apk）：替换 launcher 图标为自定义图标，其余修改相同
 
           ### 签名
 
@@ -294,6 +307,8 @@ jobs:
           gh release create "${{ needs.metadata.outputs.tag }}" \
             "${{ needs.build.outputs.output_file }}" \
             "${{ needs.build.outputs.output_file }}.sha256" \
+            "${{ needs.build.outputs.icons_output_file }}" \
+            "${{ needs.build.outputs.icons_output_file }}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --title "${{ needs.metadata.outputs.tag }} 补丁版" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
