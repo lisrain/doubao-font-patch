@@ -34,8 +34,8 @@ env:
   API_URL: https://shurufa.doubao.com/api/v1/app/download_url?platform=android
   ANDROID_BUILD_TOOLS: "37.0.0"
   SMALI_VERSION: "3.0.10"
-  BAKSMALI_SHA256: 3009d2801f4ca7d8f8fa9a389fc19ff3f3cc1ab5e21439d935aa1e971bdcd376
-  SMALI_SHA256: a84010551756b3a6dafb69545cefeb137ce7779a2a5d9a40da13719d65ae3e38
+  BAKSMALI_SHA256: 37ae4a41a8886e15c20b8362fa4250f96bbdb55e1a608199ad8b5dff068b588f
+  SMALI_SHA256: 32fa0e88a6c397b3922201adf5f3e534fbaed5a663c71d0c558c3ddce0af844a
 
 jobs:
   metadata:
@@ -153,6 +153,8 @@ jobs:
           enable-cache: false
 
       - name: Download smali tools
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tool_dir="$RUNNER_TEMP/smali-tools"
@@ -167,8 +169,39 @@ jobs:
             --output "$tool_dir/smali.jar" \
             "https://github.com/baksmali/smali/releases/download/${SMALI_VERSION}/smali-${SMALI_VERSION}-fat-release.jar"
 
-          echo "$BAKSMALI_SHA256  $tool_dir/baksmali.jar" | sha256sum --check --strict
-          echo "$SMALI_SHA256  $tool_dir/smali.jar" | sha256sum --check --strict
+          # 优先用 GitHub Releases API 的 digest（sha256:<hex>）校验，防止上游重新打包
+          # release asset 导致硬编码 checksum 漂移；API 请求失败或 digest 缺失（老 release）
+          # 时回退到 env 里的硬编码值（BAKSMALI_SHA256 / SMALI_SHA256）。
+          asset_json="$(curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            -H "authorization: Bearer ${GH_TOKEN}" \
+            -H "accept: application/vnd.github+json" \
+            "https://api.github.com/repos/baksmali/smali/releases/tags/${SMALI_VERSION}" 2>/dev/null || true)"
+
+          baksmali_expected=""
+          smali_expected=""
+          if [ -n "$asset_json" ]; then
+            baksmali_expected="$(printf '%s' "$asset_json" | jq -r --arg n "baksmali-${SMALI_VERSION}-fat-release.jar" '.assets[] | select(.name == $n) | .digest // empty' | head -n1)"
+            smali_expected="$(printf '%s' "$asset_json" | jq -r --arg n "smali-${SMALI_VERSION}-fat-release.jar" '.assets[] | select(.name == $n) | .digest // empty' | head -n1)"
+            baksmali_expected="${baksmali_expected#sha256:}"
+            smali_expected="${smali_expected#sha256:}"
+          fi
+
+          if [ -z "$baksmali_expected" ]; then
+            baksmali_expected="$BAKSMALI_SHA256"
+            echo "baksmali: GitHub API digest unavailable, falling back to hardcoded checksum"
+          else
+            echo "baksmali: verified against GitHub API digest"
+          fi
+          if [ -z "$smali_expected" ]; then
+            smali_expected="$SMALI_SHA256"
+            echo "smali: GitHub API digest unavailable, falling back to hardcoded checksum"
+          else
+            echo "smali: verified against GitHub API digest"
+          fi
+
+          echo "$baksmali_expected  $tool_dir/baksmali.jar" | sha256sum --check --strict
+          echo "$smali_expected  $tool_dir/smali.jar" | sha256sum --check --strict
           java -jar "$tool_dir/baksmali.jar" --version
           java -jar "$tool_dir/smali.jar" --version
 
