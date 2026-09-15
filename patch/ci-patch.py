@@ -1035,16 +1035,31 @@ def patch_smali(smali_path):
     end_of_catch = smali.index("\n", catch_pos) + 1
 
     old_text = smali[old_start:end_of_catch]
+
+    # 标签名由 baksmali 按指令偏移量生成，会随上游版本漂移（v1.4.4 是
+    # :try_end_9a/:catch_9b，v1.4.5 变成 :try_end_84/:catch_85）。硬编码会让
+    # .catch 指向不存在的处理块，汇编时报 "Cannot get the location of a label
+    # that hasn't been placed yet"。这里从原文本解析出真实标签名再复用。
+    label_match = re.search(
+        r"\.catch Ljava/lang/Exception;"
+        r"\s*\{:(try_start_\w+) \.\. :(try_end_\w+)\}\s*:(\w+)",
+        old_text,
+    )
+    if not label_match:
+        print("错误：无法从 _adaptive 段解析出 try/catch 标签")
+        return False
+    try_start_label, try_end_label, catch_label = label_match.groups()
+
     new_text = (
-        '    invoke-static {p0, v0},'
+        "    invoke-static {p0, v0},"
         " Landroid/graphics/Typeface;->create(Ljava/lang/String;I)"
         "Landroid/graphics/Typeface;\n"
         "\n"
         "    move-result-object p0\n"
         "\n"
-        "    :try_end_9a\n"
-        "    .catch Ljava/lang/Exception;"
-        " {:try_start_8 .. :try_end_9a} :catch_9b\n"
+        f"    :{try_end_label}\n"
+        f"    .catch Ljava/lang/Exception;"
+        f" {{:{try_start_label} .. :{try_end_label}}} :{catch_label}\n"
     )
 
     count = smali.count(old_text)
@@ -1067,6 +1082,7 @@ def patch_smali(smali_path):
         "createFromAsset 皮肤字体保留": "createFromAsset" in method,
         "ResourcesCompat.getFont 保留": "ResourcesCompat" in method,
         "qihei 默认字体已删除": "0x7f090003" not in method,
+        "异常处理块标签已定义": f"\n    :{catch_label}\n" in smali,
     }
 
     all_ok = True
