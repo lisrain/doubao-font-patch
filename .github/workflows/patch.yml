@@ -207,6 +207,12 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4.0.1
+        with:
+          # 该 action 的 packages 默认值是 "tools platform-tools"，但 Google 已把
+          # legacy `tools` 包从 SDK 仓库下架，保留默认值会让 sdkmanager 以
+          # "Failed to find package 'tools'" 返回退出码 1。这里只装 platform-tools，
+          # build-tools 由下一步按需安装。
+          packages: "platform-tools"
 
       - name: Install Android Build Tools
         run: sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
