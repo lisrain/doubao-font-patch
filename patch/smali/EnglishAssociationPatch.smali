@@ -215,7 +215,10 @@
     return v0
 .end method
 
-.method public static suppressAsciiPreeditRange(Lcom/bytedance/android/input/editor/a;II)Z
+# 参数类型使用框架接口 Landroid/view/inputmethod/InputConnection; 而非上游混淆类
+# (editor/a)：v1.4.5 的 editor/a 与 v1.4.6 的 InputConnectionWrapper 都实现该接口，
+# 而 v1.4.6 起 editor/a 已被复用为无关的 synthetic lambda 类，硬编码会导致 VerifyError。
+.method public static suppressAsciiPreeditRange(Landroid/view/inputmethod/InputConnection;II)Z
     .registers 7
 
     invoke-static {}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->isEnabled()Z
@@ -227,7 +230,7 @@
     if-lez p1, :false
 
     const/4 v0, 0x0
-    invoke-virtual {p0, p1, v0}, Lcom/bytedance/android/input/editor/a;->getTextBeforeCursor(II)Ljava/lang/CharSequence;
+    invoke-interface {p0, p1, v0}, Landroid/view/inputmethod/InputConnection;->getTextBeforeCursor(II)Ljava/lang/CharSequence;
     move-result-object v1
     invoke-static {v1}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->isAsciiIdentifier(Ljava/lang/CharSequence;)Z
     move-result v0
@@ -235,14 +238,14 @@
 
     if-lez p2, :suppress
     const/4 v0, 0x0
-    invoke-virtual {p0, p2, v0}, Lcom/bytedance/android/input/editor/a;->getTextAfterCursor(II)Ljava/lang/CharSequence;
+    invoke-interface {p0, p2, v0}, Landroid/view/inputmethod/InputConnection;->getTextAfterCursor(II)Ljava/lang/CharSequence;
     move-result-object v1
     invoke-static {v1}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->isAsciiIdentifier(Ljava/lang/CharSequence;)Z
     move-result v0
     if-eqz v0, :false
 
     :suppress
-    invoke-virtual {p0}, Lcom/bytedance/android/input/editor/a;->finishComposingText()Z
+    invoke-interface {p0}, Landroid/view/inputmethod/InputConnection;->finishComposingText()Z
     invoke-static {}, Lcom/bytedance/android/doubaoime/KeyboardJni;->resetPreEditStartPosition()V
     invoke-static {}, Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;->clearEnglishPreeditActive()V
     const/4 v0, 0x1

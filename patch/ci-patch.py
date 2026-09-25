@@ -15,6 +15,7 @@
 """
 
 import argparse
+import difflib
 import hashlib
 import os
 import re
@@ -671,7 +672,10 @@ def patch_keyboard_preedit_behavior(smali_path):
         lambda method: insert_after_registers(method, track_snippet),
     )
 
-    range_snippet = f"""    invoke-static {{v0, p0, p1}}, {ASSOCIATION_PATCH_CLASS}->suppressAsciiPreeditRange(Lcom/bytedance/android/input/editor/a;II)Z
+    # 参数类型必须与 EnglishAssociationPatch.smali 模板中的签名保持一致。
+    # 使用框架接口 InputConnection 而非上游混淆类 editor/a：v1.4.6 起 editor/a
+    # 已被复用为无关的 synthetic lambda 类，硬编码会让验证器报 VerifyError。
+    range_snippet = f"""    invoke-static {{v0, p0, p1}}, {ASSOCIATION_PATCH_CLASS}->suppressAsciiPreeditRange(Landroid/view/inputmethod/InputConnection;II)Z
 
     move-result v1
 
@@ -895,6 +899,623 @@ def migrate_primary_class(classes_out, helper_classes_out, relative_path):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source), str(target))
     print(f"    ✓ 已将 {relative_path} 迁移到辅助 DEX")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 补丁引用完整性校验
+#
+# smali 汇编只检查语法与标签，不检查跨类方法/字段是否存在、也不做参数类型
+# 兼容性验证——这两类错误会拖到运行时才变成 VerifyError / NoSuchMethodError，
+# 表现为"CI 全绿但装机闪退"（v1.4.6 的 editor/a 改名事故即此类）。
+# 下面在汇编前对补丁【新增】的指令做静态校验，发现问题立即中止构建。
+# ---------------------------------------------------------------------------
+
+# 这些前缀的类由 Android 框架/SDK 提供，不在 APK 内，无法也无需在树内解析。
+FRAMEWORK_TYPE_PREFIXES = ("Landroid/", "Ljava/", "Ljavax/", "Ldalvik/", "Lsun/")
+
+_OBJ = "Ljava/lang/Object;"
+# java.lang.Object 上必然存在的方法（树内没有 Object 的 smali，需特判）
+_OBJECT_METHOD_NAMES = {
+    "<init>", "<clinit>", "toString", "hashCode", "equals", "clone",
+    "finalize", "wait", "notify", "notifyAll", "getClass", "registerNatives",
+}
+
+# 寄存器类型哨兵
+_T_UNKNOWN = object()   # 无法解析 → 该参数跳过检查（保守，不报错）
+_T_NULL = object()      # const 0 → 可赋值给任意引用类型
+
+_INVOKE_RE = re.compile(
+    r"^invoke-(?P<kind>static|virtual|interface|super|direct)(?P<range>/range)?"
+    r"\s+\{(?P<regs>[^}]+)\},\s+"
+    r"(?P<owner>L[\w/$]+;)->(?P<name>[^\s(]+)(?P<desc>\([^)]*\)\S+)"
+)
+_FIELD_RE = re.compile(
+    r"^(?:sget|sput|iget|iput)-\w+\s+\{[^}]+\},\s+"
+    r"(L[\w/$]+;)->([^\s:]+):"
+)
+_TYPE_RE = re.compile(
+    r"^(?:new-instance|check-cast|const-class)\s+[vp]\d+,\s+(L[\w/$]+;)"
+)
+_INSTANCE_OF_RE = re.compile(r"^instance-of\s+[vp]\d+,\s+[vp]\d+,\s+(L[\w/$]+;)")
+_REG_RE = re.compile(r"^[vp]\d+$")
+_CATCH_RE = re.compile(r"^\.catch\s+\S+\s+\{:(\w+) \.\. :(\w+)\}\s+:(\w+)")
+_CATCHALL_RE = re.compile(r"^\.catchall\s+\{:(\w+) \.\. :(\w+)\}\s+:(\w+)")
+
+
+def _parse_param_types(desc):
+    """把方法描述符 '(Ljava/lang/String;I)V' 解析为参数类型列表；
+    原始类型与数组类型置 None（跳过检查）。"""
+    params = []
+    i = desc.index("(") + 1
+    while desc[i] != ")":
+        start = i
+        while desc[i] == "[":
+            i += 1
+        if desc[i] == "L":
+            i = desc.index(";", i) + 1
+            params.append(desc[start:i])
+        else:
+            i += 1
+            params.append(None)
+    # 数组（以 '[' 开头）仅做精确匹配收益低，一并置 None
+    return [None if p and p.startswith("[") else p for p in params]
+
+
+def _is_framework_type(cls):
+    return cls.startswith(FRAMEWORK_TYPE_PREFIXES)
+
+
+def _build_class_index(dex_out_dirs):
+    """扫描全部 smali，建立 类 → {methods, fields, super, interfaces, interface} 索引。
+
+    注意 .super/.implements 行出现在 .class 行【之后】，必须在整个文件头部
+    期间持续收集，不能在拿到类名后就停止（否则继承链断裂导致误判）。
+    """
+    index = {}
+    for out_dir in dex_out_dirs.values():
+        for path in Path(out_dir).rglob("*.smali"):
+            cls = None
+            entry = {
+                "methods": set(), "fields": set(),
+                "super": None, "interfaces": [], "interface": False,
+            }
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith(".class "):
+                            cls = line.split()[-1].strip()
+                            entry["interface"] = " interface " in line
+                        elif line.startswith(".super "):
+                            entry["super"] = line.split()[-1].strip()
+                        elif line.startswith(".implements "):
+                            entry["interfaces"].append(line.split()[-1].strip())
+                        elif line.startswith(".method "):
+                            entry["methods"].add(line.split()[-1].strip())
+                        elif line.startswith(".field "):
+                            m = re.match(r"\.field\s+(?:\S+\s+)*?([^\s:]+):", line)
+                            if m:
+                                entry["fields"].add(m.group(1))
+            except OSError:
+                continue
+            if cls:
+                index[cls] = entry
+    return index
+
+
+def _assignable(index, t, p):
+    """t 是否可赋值给 p：True / False / None(无法判定)。"""
+    if t is _T_NULL:
+        return True
+    if t is _T_UNKNOWN or t is None or p is None:
+        return None
+    if t == p:
+        return True
+    if p == _OBJ:
+        return True
+    if t.startswith("[") or p.startswith("["):
+        # 数组仅接受精确匹配，否则保守跳过
+        return None if t != p else True
+    if t not in index:
+        return None  # 框架类，父链不可知
+    # BFS 遍历 t 的父类与接口闭包
+    seen = set()
+    queue = [t]
+    while queue:
+        cls = queue.pop(0)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        if cls == p:
+            return True
+        if cls == _OBJ:
+            continue  # Object 顶点，该分支结束
+        if cls in index:
+            e = index[cls]
+            if e["super"]:
+                queue.append(e["super"])
+            queue.extend(e["interfaces"])
+            continue
+        # 框架类祖先：其祖先链只可能是框架类
+        if p in index:
+            # p 是树内（应用/捆绑）类，绝不可能出现在框架祖先链上 → 跳过该分支
+            continue
+        return None  # p 也是框架类，无法判定
+    # 所有分支都完整走完仍未命中 → 确认不可赋值
+    return False
+
+
+def _member_resolves(index, owner, member, kind):
+    """沿父类/接口链查找 member：True / False / None(框架祖先上无法判定)。"""
+    if owner not in index:
+        return None if _is_framework_type(owner) else False
+    seen = set()
+    queue = [owner]
+    unknown_possible = False
+    while queue:
+        cls = queue.pop(0)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        if cls in index:
+            e = index[cls]
+            if member in e[kind]:
+                return True
+            if e["super"]:
+                queue.append(e["super"])
+            queue.extend(e["interfaces"])
+            continue
+        if cls == _OBJ:
+            name = member.split("(")[0]
+            if kind == "methods" and name in _OBJECT_METHOD_NAMES:
+                return True
+            continue
+        # 框架祖先：该方法可能声明在框架类上
+        unknown_possible = True
+        continue
+    return None if unknown_possible else False
+
+
+def _norm_reg(tok, n_regs, n_params):
+    """p/v 别名归一化为物理寄存器号；无法解析返回 None。"""
+    if not _REG_RE.match(tok):
+        return None
+    if tok[0] == "v":
+        return int(tok[1:])
+    return n_regs - n_params + int(tok[1:])
+
+
+class _MethodCtx:
+    """单个 smali 方法的指令/CFG 视图，供反向 reaching-type 分析使用。"""
+
+    def __init__(self, lines, start, end):
+        self.lines = lines
+        self.texts = []          # 指令文本（已 strip）
+        label_pos = {}
+        pending = []
+        catches = []             # (start_label, end_label, handler_label)
+        n_regs = None
+        is_static = False
+        desc = None
+        cls_type = None
+
+        head = lines[start].split()
+        is_static = "static" in head
+        desc = head[-1]
+
+        i = start + 1
+        while i < end and not lines[i].strip():
+            i += 1
+        if i < end and lines[i].strip().startswith((".registers", ".locals")):
+            n_regs = int(lines[i].split()[1])
+            i += 1
+        while i < end:
+            raw = lines[i].strip()
+            if raw.startswith(":"):
+                pending.append(raw[1:].rstrip(":"))
+            elif raw.startswith(".catch "):
+                m = _CATCH_RE.match(raw)
+                if m:
+                    catches.append(m.groups())
+            elif raw.startswith(".catchall "):
+                m = _CATCHALL_RE.match(raw)
+                if m:
+                    catches.append(m.groups())
+            elif (raw and not raw.startswith(".")
+                  and not raw.startswith("#")):
+                pos = len(self.texts)
+                for lab in pending:
+                    label_pos[lab] = pos
+                pending = []
+                self.texts.append(raw)
+            # 其余（.line/.annotation/空行/注释）忽略
+            i += 1
+
+        if n_regs is None or not self.texts:
+            self.valid = False
+            return
+        self.valid = True
+        self.n_regs = n_regs
+        self.is_static = is_static
+        self.desc = desc
+        params_desc = _parse_param_types(desc)
+        self.n_params = len(params_desc) + (0 if is_static else 1)
+        if is_static:
+            self.param_types = params_desc
+        else:
+            # 实例方法：p0 为 this，类型在外部通过 bind_class 设置
+            self.param_types = [None] + params_desc
+        self._cls_type = None  # 由 bind_class 设置
+
+        m = len(self.texts)
+        # 计算每条指令的后继
+        self.succs = []
+        for idx, text in enumerate(self.texts):
+            op = text.split()[0]
+            succ = set()
+            if op.startswith("goto"):
+                lab = text.split()[-1].lstrip(":")
+                if lab in label_pos:
+                    succ.add(label_pos[lab])
+            elif op.startswith("if-"):
+                if idx + 1 < m:
+                    succ.add(idx + 1)
+                lab = text.split()[-1].lstrip(":")
+                if lab in label_pos:
+                    succ.add(label_pos[lab])
+            elif op.startswith("return") or op == "throw":
+                pass
+            else:
+                if idx + 1 < m:
+                    succ.add(idx + 1)
+            self.succs.append(succ)
+        # 异常边：try 区内指令 → handler
+        for lab_a, lab_b, lab_h in catches:
+            if lab_a in label_pos and lab_b in label_pos and lab_h in label_pos:
+                a, b = label_pos[lab_a], label_pos[lab_b]
+                h = label_pos[lab_h]
+                for k in range(a, min(b, m)):
+                    self.succs[k].add(h)
+        # 反转为前驱
+        self.preds = [set() for _ in range(m)]
+        for idx, ss in enumerate(self.succs):
+            for s in ss:
+                self.preds[s].add(idx)
+
+    def bind_class(self, cls_type):
+        self._cls_type = cls_type
+        if not self.is_static and self.param_types:
+            self.param_types[0] = cls_type
+
+    def initial_type(self, phys_reg):
+        base = self.n_regs - self.n_params
+        if phys_reg >= base:
+            k = phys_reg - base
+            if k < len(self.param_types):
+                return self.param_types[k] if self.param_types[k] else _T_UNKNOWN
+        return _T_UNKNOWN
+
+    # ---- 指令语义 ----
+    @staticmethod
+    def _dest_of(text):
+        """指令写入的目标寄存器（无写入返回 None）。"""
+        op = text.split()[0]
+        if (op.startswith(("invoke", "if-", "goto", "return", "sput", "iput"))
+                or op in ("throw", "aput", "packed-switch", "sparse-switch",
+                          "fill-array-data")
+                or op.startswith("move-result")):
+            return None
+        parts = text.split()
+        if len(parts) >= 2:
+            tok = parts[1].rstrip(",")
+            if _REG_RE.match(tok):
+                return tok
+        return None
+
+    def def_type(self, idx, text, dest_phys):
+        """dest 寄存器在该指令处的赋值类型。返回 ('switch', reg) 或类型/哨兵。"""
+        op = text.split()[0]
+        parts = text.split()
+        if op.startswith("move-result"):
+            return _T_UNKNOWN  # 宽/原始 move-result（对象的已在调用侧处理）
+        if op.startswith("move-object") or op == "move":
+            if len(parts) >= 3:
+                return ("switch", parts[2].rstrip(","))
+            return _T_UNKNOWN
+        if op.startswith("move-wide"):
+            return _T_UNKNOWN
+        if op == "new-instance":
+            return parts[-1]
+        if op == "check-cast":
+            return parts[-1]
+        if op == "const-string" or op == "const-string/jumbo":
+            return "Ljava/lang/String;"
+        if op == "const-class":
+            return "Ljava/lang/Class;"
+        if op.startswith("const"):
+            # const/4 v0, 0x0 → null
+            try:
+                val = parts[-1]
+                if val in ("0x0", "0", "-0x1"):
+                    return _T_NULL if val != "-0x1" else _T_UNKNOWN
+            except IndexError:
+                pass
+            return _T_UNKNOWN
+        if op.startswith("sget-object"):
+            return text.split(",")[-1].strip().rsplit(":", 1)[-1]
+        if op.startswith("sget"):
+            return _T_UNKNOWN
+        return _T_UNKNOWN  # 算术/数组/iget 等
+
+    def reaching_types(self, start_idx, reg_tok):
+        """反向数据流：求 start_idx 处寄存器的 reaching 类型集合。"""
+        start_phys = _norm_reg(reg_tok, self.n_regs, self.n_params)
+        if start_phys is None:
+            return [_T_UNKNOWN]
+        types = []
+        seen = set()
+        stack = [(start_idx, start_phys)]
+        while stack:
+            idx, phys = stack.pop()
+            if (idx, phys) in seen:
+                continue
+            seen.add((idx, phys))
+            text = self.texts[idx]
+            op = text.split()[0]
+            parts = text.split()
+
+            # move-result-object 绑定上一条 invoke 的返回类型
+            if op == "move-result-object":
+                dest = _norm_reg(parts[1], self.n_regs, self.n_params)
+                if dest == phys:
+                    prev = self.texts[idx - 1] if idx > 0 else ""
+                    m = _INVOKE_RE.match(prev)
+                    if m:
+                        ret = m.group("desc").split(")", 1)[1]
+                        if ret.startswith(("L", "[")):
+                            types.append(ret)
+                        else:
+                            types.append(_T_UNKNOWN)
+                    else:
+                        types.append(_T_UNKNOWN)
+                    continue
+
+            dest_tok = self._dest_of(text)
+            if dest_tok is not None:
+                dest_phys = _norm_reg(dest_tok, self.n_regs, self.n_params)
+                if dest_phys == phys:
+                    d = self.def_type(idx, text, dest_phys)
+                    if isinstance(d, tuple) and d[0] == "switch":
+                        other = _norm_reg(d[1], self.n_regs, self.n_params)
+                        if other is None:
+                            types.append(_T_UNKNOWN)
+                        else:
+                            stack.append((idx, other))
+                        continue
+                    types.append(d)
+                    continue
+
+            # 该指令不写目标寄存器 → 沿前驱继续
+            ps = self.preds[idx]
+            if not ps:
+                # 无前驱 = 方法入口 → 使用参数初始类型
+                types.append(self.initial_type(phys))
+                continue
+            for p in ps:
+                stack.append((p, phys))
+        return types or [_T_UNKNOWN]
+
+
+def _merge_verdicts(verdicts):
+    if any(v is False for v in verdicts):
+        return False
+    if any(v is None for v in verdicts):
+        return None
+    return True
+
+
+def _check_invoke(line, method, idx, index):
+    """校验一条 invoke 指令：目标可解析 + 实参类型可赋值。返回问题列表。"""
+    m = _INVOKE_RE.match(line)
+    if not m:
+        return []  # invoke-polymorphic/custom 等罕见形式，跳过
+    problems = []
+    owner = m.group("owner")
+    member = m.group("name") + m.group("desc")
+
+    # 1. 目标方法存在性（框架 owner 无法校验，跳过）
+    if not _is_framework_type(owner):
+        res = _member_resolves(index, owner, member, "methods")
+        if res is False:
+            kind = "类" if owner not in index else "方法"
+            problems.append(
+                f"invoke 目标{kind}不存在: {owner}{member}"
+                + ("" if owner in index else "（类不在 APK 内）")
+            )
+
+    # 2. 实参类型可赋值性（含 receiver）
+    if m.group("range"):
+        return problems  # range 形式寄存器展开复杂，补丁未使用，保守跳过
+    regs = [r.strip() for r in m.group("regs").split(",")]
+    params = _parse_param_types(m.group("desc"))
+    if m.group("kind") == "static":
+        arg_pairs = list(zip(regs, params))
+    else:
+        if not regs:
+            return problems
+        arg_pairs = [(regs[0], owner)] + list(zip(regs[1:], params))
+
+    for reg, p in arg_pairs:
+        if p is None:
+            continue  # 原始/数组参数跳过
+        types = method.reaching_types(idx, reg)
+        # 逐个 reaching 类型判定：任一不可赋值即失败（验证器同样按合并类型裁决）
+        per = [
+            None if t is _T_UNKNOWN else _assignable(index, t, p)
+            for t in types
+        ]
+        if _merge_verdicts(per) is False:
+            shown = ", ".join(
+                "?" if t is _T_UNKNOWN else
+                ("null" if t is _T_NULL else t) for t in types
+            )
+            problems.append(
+                f"实参类型不可赋值: {reg}={{{shown}}} → 参数 {p}"
+            )
+    return problems
+
+
+def verify_patched_references(dex_out_dirs, snapshot_dir):
+    """对比补丁前后的 smali，校验补丁新增指令的引用完整性。
+
+    - 新增/新文件中的每个 invoke：目标方法必须能在 APK 类层次中解析；
+    - invoke 实参（含 receiver）：寄存器的 reaching 类型必须可赋值给声明参数；
+    - 字段指令：目标字段必须存在；
+    - new-instance/check-cast：目标类必须存在。
+    校验失败返回 False，中止构建。
+    """
+    print("  校验补丁引用完整性...")
+    index = _build_class_index(dex_out_dirs)
+    print(f"  ✓ 已索引 {len(index)} 个类定义")
+
+    # 快照文件集合（用于识别"移动未修改"的类）
+    snap_files = {}
+    if Path(snapshot_dir).exists():
+        for sp in Path(snapshot_dir).rglob("*.smali"):
+            try:
+                snap_files[hashlib.sha1(sp.read_bytes()).hexdigest()] = sp
+            except OSError:
+                pass
+
+    problems = []
+    checked_files = 0
+
+    for dex_name, out_dir in dex_out_dirs.items():
+        snap_root = Path(snapshot_dir) / dex_name
+        for path in Path(out_dir).rglob("*.smali"):
+            rel = path.relative_to(out_dir)
+            snap_path = snap_root / rel
+            try:
+                new_text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                problems.append(f"{rel}: 读取失败 {exc}")
+                continue
+
+            check_all_lines = False
+            check_line_nums = None  # None → 全部；set → 仅这些行（0 基）
+            if not snap_path.exists():
+                # 新文件：可能是 migrate 移动的原文件（内容一致则跳过）
+                digest = hashlib.sha1(new_text.encode("utf-8")).hexdigest()
+                if digest in snap_files:
+                    continue
+                check_all_lines = True
+            else:
+                old_text = snap_path.read_text(
+                    encoding="utf-8", errors="replace")
+                if old_text == new_text:
+                    continue
+                old_lines = old_text.splitlines()
+                new_lines = new_text.splitlines()
+                sm = difflib.SequenceMatcher(
+                    None, old_lines, new_lines, autojunk=False)
+                check_line_nums = set()
+                for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+                    if tag in ("insert", "replace"):
+                        check_line_nums.update(range(j1, j2))
+                if not check_line_nums:
+                    continue
+
+            lines = new_text.splitlines()
+            checked_files += 1
+
+            # 逐方法处理：收集待检查行所属的方法
+            method_spans = []  # (start, end)
+            for i, ln in enumerate(lines):
+                if ln.startswith(".method "):
+                    for j in range(i + 1, len(lines)):
+                        if lines[j].startswith(".end method"):
+                            method_spans.append((i, j))
+                            break
+
+            for start, end in method_spans:
+                if check_all_lines:
+                    targets = [
+                        k for k in range(start + 1, end)
+                        if lines[k].strip()
+                        and not lines[k].strip().startswith(("."))
+                    ]
+                else:
+                    targets = [
+                        k for k in (check_line_nums or set())
+                        if start < k < end
+                    ]
+                if not targets:
+                    continue
+                ctx = _MethodCtx(lines, start, end)
+                if not ctx.valid:
+                    continue
+                # 绑定当前类
+                cls_type = None
+                for k in range(start, -1, -1):
+                    if lines[k].startswith(".class "):
+                        cls_type = lines[k].split()[-1].strip()
+                        break
+                ctx.bind_class(cls_type)
+
+                # 指令行号 → 指令索引 映射
+                line_to_idx = {}
+                pos = 0
+                for k in range(start + 1, end):
+                    raw = lines[k].strip()
+                    if (raw and not raw.startswith((".", "#", ":"))):
+                        line_to_idx[k] = pos
+                        pos += 1
+
+                for k in sorted(targets):
+                    raw = lines[k].strip()
+                    if not raw or raw.startswith((".", "#", ":")):
+                        continue
+                    file_rel = f"{dex_name}/{rel}"
+                    loc = f"{file_rel}:{k + 1}"
+
+                    if raw.startswith("invoke-"):
+                        idx = line_to_idx.get(k)
+                        if idx is None:
+                            continue
+                        for prob in _check_invoke(raw, ctx, idx, index):
+                            problems.append(f"{loc}: {prob}")
+                        continue
+
+                    fm = _FIELD_RE.match(raw)
+                    if fm:
+                        owner, field = fm.group(1), fm.group(2)
+                        if not _is_framework_type(owner):
+                            res = _member_resolves(index, owner, field, "fields")
+                            if res is False:
+                                problems.append(
+                                    f"{loc}: 字段不存在: {owner}->{field}"
+                                )
+                        continue
+
+                    tm = _TYPE_RE.match(raw) or _INSTANCE_OF_RE.match(raw)
+                    if tm:
+                        t = tm.group(1)
+                        if not _is_framework_type(t) and t not in index:
+                            problems.append(
+                                f"{loc}: 类不存在: {t}（类不在 APK 内）"
+                            )
+                        continue
+
+    print(f"  ✓ 已校验 {checked_files} 个被修改/新增的 smali 文件")
+    if problems:
+        limit = 50
+        for prob in problems[:limit]:
+            print(f"  ✗ {prob}")
+        if len(problems) > limit:
+            print(f"  ... 另有 {len(problems) - limit} 个问题")
+        print(f"  ✗ 引用完整性校验失败：共 {len(problems)} 个问题")
+        return False
+    print("  ✓ 引用完整性校验通过")
     return True
 
 
@@ -1374,6 +1995,12 @@ def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
     classes_out = dex_out_dirs["classes.dex"]
     helper_classes_out = dex_out_dirs[helper_dex_name]
 
+    # 快照原始反编译结果，供补丁后的引用完整性校验做前后对比
+    snapshot_dir = work_dir / "_orig_smali_snapshot"
+    for name, out_dir in dex_out_dirs.items():
+        shutil.copytree(out_dir, snapshot_dir / name)
+    print("  ✓ 已快照原始 smali（用于引用完整性校验）")
+
     # 5. 打补丁
     print("[5/7] 修改 smali 文件...")
     smali_path = classes_out / SMALI_KEYBOARD_VIEW
@@ -1409,6 +2036,13 @@ def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
         classes_out, helper_classes_out, association_resource_ids
     ):
         print("错误：英文单词补全联想补丁安装失败")
+        return False
+
+    # 5.5 引用完整性校验：补丁新增的跨类引用必须在本 APK 内可解析，
+    #     且 invoke 实参类型必须与声明参数兼容，否则运行时会 VerifyError。
+    print()
+    if not verify_patched_references(dex_out_dirs, snapshot_dir):
+        print("错误：补丁引用完整性校验失败，拒绝打包")
         return False
 
     # 6. 汇编
