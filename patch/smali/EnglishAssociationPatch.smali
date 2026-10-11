@@ -101,7 +101,7 @@
     const/4 v1, 0x0
     invoke-virtual {v5, v1}, Landroid/view/View;->setVisibility(I)V
 
-    invoke-virtual {v3}, Lcom/bytedance/common_biz/ui/widget/ImeListItemView;->a()Landroidx/appcompat/widget/SwitchCompat;
+    invoke-virtual {v3}, Lcom/bytedance/common_biz/ui/widget/ImeListItemView;->__SWITCH_ACCESSOR__()Landroidx/appcompat/widget/SwitchCompat;
     move-result-object v4
     if-eqz v4, :return
     invoke-virtual {v4, v1}, Landroid/view/View;->setVisibility(I)V

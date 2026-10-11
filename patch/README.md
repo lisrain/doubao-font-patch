@@ -88,11 +88,13 @@ public static Typeface createTypeFace(String fontName, boolean bold, int weight)
 
 `ImeListItemView` 内部视图 ID、圆角/内边距 dimen 与卡片背景色在不同版本间会整体漂移（1.3.17 → 1.4.0 全部变化，直接导致进入智能联想页面 NPE 闪退）。因此模板 smali 中只保留占位 ID，构建时由脚本解析输入 APK 的 `resources.arsc`，按资源名（`id/item_title`、`id/text_container`、`id/item_accessory_container`、`dimen/ime_dp_15`、`dimen/ime_dp_14`、`dimen/ime_dp_6`、`color/ime_color_setting_item_bg`）动态解析真实 ID 回填，并对所有 `findViewById` 结果做空保护，任何一步找不到视图时静默跳过、不再闪退。
 
-`SettingsConfigNext` 的混淆方法名同样会漂移（1.3.17 的写入入口 `l` / 写入者 `o` / 输入法进程写入 `m`，在 1.4.0 变为 `m` / `p` / `n`）。构建时脚本自动探测三个角色：写入入口为通过 `{p0, p1}` 委托同类 `(String,Object)V` 方法的静态方法；输入法进程写入者从 `KeyboardJni.updateSettingsStringValue` 实际调用的 `(String,String)V` 实例方法提取。开关监听器调用写入入口，两个 hook 点分别落在写入者与输入法进程写入者上。
+`ImeListItemView` 上取 `SwitchCompat` 的访问器名同样会漂移（1.4.6 是混淆名 `a()`，1.5.1 起上游改用 Kotlin 属性访问器 `getSwitchButton()`），模板里以 `__SWITCH_ACCESSOR__` 占位，构建时从 APK 内该类解析出唯一一个 `()Landroidx/appcompat/widget/SwitchCompat;` 方法回填。这类引用完整性校验拦不住——`ImeListItemView` 的父类是框架类，沿继承链找不到时只能判“未知”而非“不存在”。
+
+`SettingsConfigNext` 的混淆方法名与形参顺序都会漂移（1.3.17 写入入口 `l` / 写入者 `o` / 输入法进程写入 `m`；1.4.0 变成 `m` / `p` / `n`；1.5.1 变成 `j` / `n` / `k`，且 key 从第一个形参挪到了第二个）。构建时脚本按结构探测各角色，不再依赖方法名：读取入口取 `(String)Object` 静态方法，默认值读取入口取 `(String,Object)Object` 或 `(Object,String)Object`，写入入口取委托给同类写入方法的 `static (String,Object)V`，输入法进程写入者取 `KeyboardJni.updateSettingsStringValue` 实际调用的 `(String,String)V`。key/value 落在哪个寄存器由 Kotlin 生成的 `checkNotNullParameter(x, "key"/"value")` 反查，因此形参顺序变化也能正确落位。开关监听器调用写入入口，两个 hook 点分别落在写入者与输入法进程写入者上。
 
 ### 修改四：英文 composing 文本的数字/符号键盘切换提交
 
-英文输入过程中，当前单词可能以带下划线的 composing/preedit 文本存在。原逻辑切换到数字或符号键盘时直接调用 native `switchKeyboard(5/3)`，没有先调用 `finishComposingText()`，导致返回英文键盘后下一次字母输入会覆盖之前的整个组合单词。
+英文输入过程中，当前单词可能以带下划线的 composing/preedit 文本存在。原逻辑切换到数字或符号键盘时直接调用 native `switchKeyboard`（板型取 `InputBoardType` 枚举序号，1.4.x 是常量 `5/3`），没有先调用 `finishComposingText()`，导致返回英文键盘后下一次字母输入会覆盖之前的整个组合单词。
 
 补丁在数字和符号键盘切换入口前增加提交逻辑，仅当当前是英文键盘且存在 preedit 时执行 `stopInputAndCommitPinyin()` 与 `finishPreedit(true)`，中文输入和无 composing 文本时保持原行为。同时跟踪英文 `UpdatePreedit()` 状态，在关闭英文联想开关时拦截 ASCII 字母、数字、连字符、下划线和点号组成的 `SetPreeditRange()`，并清理 `preEditStartPosition`，避免 `claude-opus` 等连续标识符在切换数字键盘后重新变成整段可覆盖的下划线编辑区。
 

@@ -40,6 +40,9 @@ SMALI_ASSOCIATION_FRAGMENT = (
 ASSOCIATION_PATCH_CLASS = (
     "Lcom/bytedance/android/input/fragment/settings/EnglishAssociationPatch;"
 )
+# EnglishAssociationPatch.smali 里 ImeListItemView 开关访问器的占位符，
+# 构建时按上游当前版本解析（见 resolve_switch_accessor）
+SWITCH_ACCESSOR_PLACEHOLDER = "__SWITCH_ACCESSOR__"
 DEX_METHOD_LIMIT = 65535
 PRIMARY_DEX_MIGRATION_THRESHOLD = 65520
 DEX_MIGRATION_CLASS = "J/N.smali"
@@ -212,26 +215,88 @@ def read_png_size(data):
     return None
 
 
-def pick_best_launcher_png(strings_raw, key):
-    """在 arsc 全局字符串池中为指定图标名挑选密度最高的 PNG 路径。"""
-    prefix = "res/mipmap-"
-    suffix = f"/{key}.png"
-    best_index = best_rank = None
-    for index, path in enumerate(strings_raw):
-        if not (path.startswith(prefix) and path.endswith(suffix)):
+def parse_mipmap_paths(arsc_data):
+    """解析 arsc 里 mipmap 类型下每个资源名在各密度下的文件路径。
+
+    v1.5.x 起上游混淆了资源文件路径（res/mipmap-hdpi/ic_launcher.png →
+    res/9w.png），但类型名与资源名（ic_launcher）仍在，所以不能再靠字符串池里的
+    路径前缀匹配，改为按「资源名 + 密度」查表。
+
+    返回 {资源名: {density: (字符串池索引, 路径)}}。
+    """
+    data = bytearray(arsc_data)
+    table_type, header_size, _size = struct.unpack_from("<HHI", data, 0)
+    if table_type != 0x0002:
+        raise ValueError("无效的 resources.arsc 头部")
+    package_count = struct.unpack_from("<I", data, 8)[0]
+    offset = header_size
+    _t, _h, global_pool_size = struct.unpack_from("<HHI", data, offset)
+    strings_raw = parse_string_pool_raw(data, offset)
+    offset += global_pool_size
+
+    paths = {}
+    for _ in range(package_count):
+        chunk_type, chunk_header_size, chunk_size = struct.unpack_from(
+            "<HHI", data, offset)
+        if chunk_type != 0x0200:
+            offset += chunk_size
             continue
-        qualifier = path[len(prefix):len(path) - len(suffix)]
-        dpi = re.sub(r"-v\d+$", "", qualifier)
-        rank = ICON_DPI_RANK.get(dpi, -1)
-        if best_rank is None or rank > best_rank:
-            best_index, best_rank = index, rank
-    return best_index
+        type_strings_offset, _last_public_type, key_strings_offset = struct.unpack_from(
+            "<III", data, offset + 12 + 256)
+        type_names = parse_string_pool_raw(data, offset + type_strings_offset)
+        key_names = parse_string_pool_raw(data, offset + key_strings_offset)
+        cursor = offset + chunk_header_size
+        chunk_end = offset + chunk_size
+        while cursor < chunk_end:
+            inner_type, inner_header_size, inner_size = struct.unpack_from(
+                "<HHI", data, cursor)
+            if (inner_type == 0x0201
+                    and type_names[data[cursor + 8] - 1] == "mipmap"):
+                # ResTable_type 头 20 字节后是 ResTable_config，density 在其 +14
+                density = struct.unpack_from("<H", data, cursor + 20 + 14)[0]
+                entry_count = struct.unpack_from("<I", data, cursor + 12)[0]
+                entries_start = struct.unpack_from("<I", data, cursor + 16)[0]
+                for entry_index in range(entry_count):
+                    entry_offset = struct.unpack_from(
+                        "<I", data, cursor + inner_header_size + entry_index * 4
+                    )[0]
+                    if entry_offset == 0xFFFFFFFF:
+                        continue
+                    entry_pos = cursor + entries_start + entry_offset
+                    flags = struct.unpack_from("<H", data, entry_pos + 2)[0]
+                    if flags & 0x0001:
+                        continue
+                    key = key_names[
+                        struct.unpack_from("<I", data, entry_pos + 4)[0]
+                    ]
+                    value_pos = entry_pos + 8
+                    if data[value_pos + 3] != 0x03:
+                        continue
+                    string_index = struct.unpack_from("<I", data, value_pos + 4)[0]
+                    paths.setdefault(key, {})[density] = (
+                        string_index, strings_raw[string_index]
+                    )
+            cursor += inner_size
+        offset += chunk_size
+    return paths
 
 
-def retarget_adaptive_icon_entries(arsc_data, icon_keys):
+def best_launcher_png_entry(mipmap_paths, key):
+    """取资源名下密度最高的 PNG 条目（跳过 anydpi 上的 .xml），返回 (索引, 路径)。"""
+    candidates = [
+        (density, entry)
+        for density, entry in mipmap_paths.get(key, {}).items()
+        if density > 0 and not entry[1].endswith(".xml")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def retarget_adaptive_icon_entries(arsc_data, icon_keys, mipmap_paths):
     """
     将 mipmap/ic_launcher* 在 anydpi-v26 配置下指向 .xml 的条目，
-    原地重定向到字符串池中已有的最高密度 PNG 路径，
+    原地重定向到 arsc 中已有的最高密度 PNG 路径，
     使 Android 8.0+ 设备使用替换后的普通 PNG 图标而非原自适应图标。
     仅修改 entry 的字符串索引（4 字节），块大小不变。
     """
@@ -283,18 +348,19 @@ def retarget_adaptive_icon_entries(arsc_data, icon_keys):
                     old_path = strings_raw[old_index]
                     if not old_path.endswith(".xml"):
                         continue
-                    new_index = pick_best_launcher_png(strings_raw, key)
-                    if new_index is None:
-                        raise ValueError(f"字符串池中找不到 {key} 的 PNG 路径")
+                    new_entry = best_launcher_png_entry(mipmap_paths, key)
+                    if new_entry is None:
+                        raise ValueError(f"arsc 中找不到 {key} 的 PNG 路径")
+                    new_index = new_entry[0]
                     struct.pack_into("<I", data, value_pos + 4, new_index)
-                    retargeted.append((key, old_path, strings_raw[new_index]))
+                    retargeted.append((key, old_path, new_entry[1]))
             cursor += inner_size
         offset += chunk_size
 
     return bytes(data), retargeted
 
 
-def collect_icon_replacements(zip_names, icon_dir):
+def collect_icon_replacements(zip_names, icon_dir, mipmap_paths):
     """
     收集图标目录中的 launcher PNG，映射到 APK 内实际路径。
     返回 (zip 内容替换映射, 需要自适应图标重定向的资源名集合)。
@@ -308,16 +374,17 @@ def collect_icon_replacements(zip_names, icon_dir):
     ):
         dpi = dpi_dir.name[len("mipmap-"):]
         expected_size = EXPECTED_ICON_SIZES.get(dpi)
+        density = ICON_DPI_RANK.get(dpi)
         for png in sorted(dpi_dir.glob("*.png")):
             key = png.stem
-            matches = [
-                name for name in sorted(available)
-                if re.fullmatch(rf"res/mipmap-{dpi}(?:-[a-z0-9]+)*/{re.escape(png.name)}", name)
-            ]
-            if len(matches) != 1:
-                print(f"  - 跳过 {png.relative_to(icon_dir)}: APK 内匹配到 {len(matches)} 个路径")
+            entry = mipmap_paths.get(key, {}).get(density)
+            if entry is None:
+                print(f"  - 跳过 {png.relative_to(icon_dir)}: APK 未包含该密度的 {key}")
                 continue
-            zip_path = matches[0]
+            zip_path = entry[1]
+            if zip_path not in available:
+                print(f"  - 跳过 {png.relative_to(icon_dir)}: APK 内缺少 {zip_path}")
+                continue
             data = png.read_bytes()
             size = read_png_size(data)
             if size and expected_size and size != (expected_size, expected_size):
@@ -400,203 +467,346 @@ def replace_method_candidates(smali, declarations, transform, description):
     return replace_method(smali, matches[0], transform)
 
 
+def _param_named(method_body, name):
+    """按 Kotlin 形参名反查 smali 寄存器（p0/p1/...）。
+
+    Kotlin 编译器会给每个引用类型形参插入一次
+    `checkNotNullParameter(x, "<形参名>")`，形参名以字符串字面量留在字节码里。
+    上游改版会重排形参顺序（v1.5.1 起 SettingsConfigNext 的 key 从第一个形参挪到
+    第二个、value 变成第一个），按名字取寄存器比按位置硬编码稳。
+
+    找不到时返回 None，交由调用方回退到按位置推断。
+    """
+    match = re.search(
+        r'const-string(?:/jumbo)? v\d+, "' + re.escape(name) + r'"\n'
+        r'\s*\n'
+        r'\s*invoke-static \{(p\d+), v\d+\}, '
+        r'Lkotlin/jvm/internal/\w+;->\w+\(',
+        method_body,
+    )
+    return match.group(1) if match else None
+
+
+def _counterpart_register(register):
+    """给定一个形参寄存器，返回两参方法里的另一个形参。"""
+    return "p1" if register == "p0" else "p0"
+
+
+def _locate_method(smali, declaration_pattern):
+    """按声明正则定位 smali 方法，返回 (声明行, 方法体)，未命中返回 (None, None)。
+
+    声明正则需带 (?P<name>\\w+)；方法体不带声明行与 .end method。
+    """
+    match = re.search(
+        declaration_pattern + r"\n(?P<body>.*?)\n\.end method", smali, re.DOTALL
+    )
+    if not match:
+        return None, None
+    return match.group(0).split("\n", 1)[0], match.group("body")
+
+
 def detect_settings_sync_methods(settings_smali_path, keyboard_jni_path):
-    """探测 SettingsConfigNext 的写入入口、设置进程写入者与输入法进程写入方法。
+    """探测 SettingsConfigNext 的读写入口及各自的 key/value 寄存器。
 
-    - 写入入口：static (String,Object)V 方法，方法体通过 {p0, p1} 委托给同签名写入者
-    - 设置进程写入者：写入入口的委托目标（补丁 hook 点）
-    - 输入法进程写入者：KeyboardJni.updateSettingsStringValue 调用的
-      SettingsConfigNext.(String,String)V 实例方法（补丁 hook 点）
+    上游每次改版都会重新混淆方法名（v1.4.6 的入口是 f/g/m，v1.5.1 变成
+    d/e/j/k/n），还会重排形参顺序，所以这里全部按结构探测而不是硬编码。
 
-    返回 (entry, settings_writer, ime_writer)，探测失败的位置为 None。
+    返回 dict，探测不到的位置为 None：
+
+      get_decl / get_key
+          读取入口 `(String)Object`
+      get_default_decl / get_default_key / get_default_value
+          带默认值的读取入口
+      set_entry
+          设置进程写入入口 `static (String,Object)V`
+      set_writer_decl / set_key / set_value
+          设置进程实际写入方法（set_entry 的委托目标，补丁 hook 点）
+      ime_writer_decl / ime_key / ime_value
+          输入法进程写入方法（KeyboardJni.updateSettingsStringValue 的调用目标）
+      changed_decl / changed_key / changed_result / changed_label
+          onSharedPreferenceChanged 里 containsKey 的 key 寄存器、结果寄存器
+          与"已注册"分支标签
     """
     settings_smali = settings_smali_path.read_text(encoding="utf-8")
-    entries = []
-    for match in re.finditer(
-        r"\.method public static final (\w+)\(Ljava/lang/String;Ljava/lang/Object;\)V\n"
-        r"(.*?)\n\.end method",
-        settings_smali,
-        re.DOTALL,
-    ):
-        delegate = re.search(
-            r"invoke-static \{p0, p1\}, "
-            r"Lcom/bytedance/android/input/common/SettingsConfigNext;->"
-            r"(\w+)\(Ljava/lang/String;Ljava/lang/Object;\)V",
-            match.group(2),
-        )
-        if delegate:
-            entries.append((match.group(1), delegate.group(1)))
-    entry = settings_writer = None
-    if len(entries) == 1:
-        entry, settings_writer = entries[0]
-        print(f"    ✓ 设置写入入口: {entry} → 写入者 {settings_writer}")
-    else:
-        print(f"    ⚠ 设置写入入口探测异常: {entries}")
-
-    ime_writer = None
-    keyboard_smali = keyboard_jni_path.read_text(encoding="utf-8")
-    sync_match = re.search(
-        r"\.method public static updateSettingsStringValue"
-        r"\(Ljava/lang/String;Ljava/lang/String;\)V\n"
-        r"(.*?)\n\.end method",
-        keyboard_smali,
-        re.DOTALL,
+    info = dict.fromkeys(
+        [
+            "get_decl", "get_key",
+            "get_default_decl", "get_default_key", "get_default_value",
+            "set_entry", "set_writer_decl", "set_key", "set_value",
+            "ime_writer_decl", "ime_key", "ime_value",
+            "changed_decl", "changed_key", "changed_result", "changed_label",
+        ]
     )
-    if sync_match:
-        target = re.search(
-            r"invoke-virtual \{[vp]\d+, p0, p1\}, "
+
+    def report(role, found, extra=""):
+        status = f"✓ {found}" if found else "⚠ 探测失败"
+        print(f"    [{status}]{extra}")
+
+    # --- 读取入口：static (String)Object ---
+    decl, body = _locate_method(
+        settings_smali,
+        r"\.method public static (?:final )?(?P<name>\w+)"
+        r"\(Ljava/lang/String;\)Ljava/lang/Object;",
+    )
+    if decl:
+        info["get_decl"] = decl
+        info["get_key"] = _param_named(body, "key") or "p0"
+    report("读取入口", info["get_decl"], f"，key={info['get_key']}" if decl else "")
+
+    # --- 带默认值的读取入口：(String,Object)Object 或 (Object,String)Object ---
+    decl, body = _locate_method(
+        settings_smali,
+        r"\.method public static (?:final )?(?P<name>\w+)\("
+        r"(?:Ljava/lang/String;Ljava/lang/Object;"
+        r"|Ljava/lang/Object;Ljava/lang/String;)"
+        r"\)Ljava/lang/Object;",
+    )
+    if decl:
+        info["get_default_decl"] = decl
+        key = _param_named(body, "key")
+        if key is None:
+            # 回退：key 是被送进 HashMap.get 的那个形参
+            lookup = re.search(
+                r"invoke-virtual \{v\d+, (p\d+)\}, "
+                r"Ljava/util/HashMap;->get\(Ljava/lang/Object;\)",
+                body,
+            )
+            key = lookup.group(1) if lookup else "p0"
+        info["get_default_key"] = key
+        info["get_default_value"] = (
+            _param_named(body, "default") or _counterpart_register(key)
+        )
+    report("默认值读取入口", info["get_default_decl"])
+    report("默认值读取 key", info["get_default_key"])
+
+    # --- 设置进程写入入口：static (String,Object)V，方法体尾部委托给同类写入方法 ---
+    entry_decl, body = _locate_method(
+        settings_smali,
+        r"\.method public static (?:final )?(?P<name>\w+)"
+        r"\(Ljava/lang/String;Ljava/lang/Object;\)V",
+    )
+    writer = None
+    if body:
+        info["set_entry"] = re.search(r"(?P<name>\w+)\(", entry_decl).group("name")
+        delegates = re.findall(
+            r"invoke-\w+ \{[^}]+\}, "
+            r"Lcom/bytedance/android/input/common/SettingsConfigNext;->"
+            r"(\w+)\([^)]*\)V",
+            body,
+        )
+        delegates = [d for d in delegates if d != info["set_entry"]]
+        if delegates:
+            writer = delegates[-1]
+    report("设置写入入口", info["set_entry"])
+
+    if writer:
+        info["set_writer_decl"], writer_body = _locate_method(
+            settings_smali,
+            r"\.method public (?:static )?(?:final )?(?P<name>" +
+            re.escape(writer) + r")\([^)]*\)V",
+        )
+        key = _param_named(writer_body or "", "key")
+        if key:
+            info["set_key"] = key
+            info["set_value"] = (
+                _param_named(writer_body or "", "value") or _counterpart_register(key)
+            )
+    report("设置进程写入点", info["set_writer_decl"])
+    report("设置写入 key", info["set_key"])
+
+    # --- 输入法进程写入：KeyboardJni.updateSettingsStringValue 的调用目标 ---
+    keyboard_smali = keyboard_jni_path.read_text(encoding="utf-8")
+    _, sync_body = _locate_method(
+        keyboard_smali,
+        r"\.method public static (?P<name>updateSettingsStringValue)"
+        r"\(Ljava/lang/String;Ljava/lang/String;\)V",
+    )
+    ime_writer = None
+    if sync_body:
+        for call in re.finditer(
+            r"invoke-(?:static|virtual) \{([^}]*)\}, "
             r"Lcom/bytedance/android/input/common/SettingsConfigNext;->"
             r"(\w+)\(Ljava/lang/String;Ljava/lang/String;\)V",
-            sync_match.group(1),
-        )
-        if target:
-            ime_writer = target.group(1)
+            sync_body,
+        ):
+            args = [a.strip() for a in call.group(1).split(",")]
+            if args[-2:] == ["p0", "p1"]:
+                ime_writer = call.group(2)
+                break
     if ime_writer:
-        print(f"    ✓ 输入法进程写入方法: {ime_writer}")
-    else:
-        print("    ⚠ 输入法进程写入方法探测失败，回退候选签名")
-    return entry, settings_writer, ime_writer
+        info["ime_writer_decl"], writer_body = _locate_method(
+            settings_smali,
+            r"\.method public (?:static )?(?:final )?(?P<name>" +
+            re.escape(ime_writer) + r")\(Ljava/lang/String;Ljava/lang/String;\)V",
+        )
+        key = _param_named(writer_body or "", "key")
+        if key:
+            info["ime_key"] = key
+            info["ime_value"] = (
+                _param_named(writer_body or "", "value") or _counterpart_register(key)
+            )
+    report("输入法进程写入点", info["ime_writer_decl"])
+    report("输入法写入 key", info["ime_key"])
+
+    # --- onSharedPreferenceChanged 的 containsKey 分支 ---
+    decl, changed_body = _locate_method(
+        settings_smali,
+        r"\.method public (?:final )?(?P<name>onSharedPreferenceChanged)"
+        r"\(Landroid/content/SharedPreferences;Ljava/lang/String;\)V",
+    )
+    if changed_body:
+        contains = re.search(
+            r"invoke-virtual \{v\d+, (p\d+)\}, "
+            r"Ljava/util/HashMap;->containsKey\(Ljava/lang/Object;\)Z\n"
+            r"\s*\n"
+            r"\s*move-result (\w+)\n"
+            r"\s*\n"
+            r"\s*if-nez \2, :(\w+)",
+            changed_body,
+        )
+        if contains:
+            info["changed_decl"] = decl
+            info["changed_key"] = contains.group(1)
+            info["changed_result"] = contains.group(2)
+            info["changed_label"] = contains.group(3)
+    report(
+        "未知键分支",
+        info["changed_label"],
+        f"，key={info['changed_key']}，结果寄存器={info['changed_result']}"
+        if info["changed_label"] else "",
+    )
+
+    return info
 
 
-def patch_settings_config(smali_path, settings_writer=None, ime_writer=None):
+def patch_settings_config(smali_path, info):
     """让自定义布尔配置复用原有 SettingsConfigNext 跨进程同步链路。"""
     print("  修补 SettingsConfigNext 自定义配置支持...")
     smali = smali_path.read_text(encoding="utf-8")
 
-    get_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
+    required = {
+        "读取入口": "get_decl",
+        "默认值读取入口": "get_default_decl",
+        "设置进程写入点": "set_writer_decl",
+        "输入法进程写入点": "ime_writer_decl",
+        "未知键分支": "changed_label",
+    }
+    missing = [label for label, key in required.items() if not info.get(key)]
+    if missing:
+        print(f"    ✗ 探测结果不完整，缺少: {'、'.join(missing)}")
+        return False
 
-    move-result v0
+    def read_snippet(key_register, label):
+        return (
+            f"    invoke-static {{{key_register}}}, {ASSOCIATION_PATCH_CLASS}"
+            "->isPatchKey(Ljava/lang/String;)Z\n"
+            "\n"
+            "    move-result v0\n"
+            "\n"
+            f"    if-eqz v0, :{label}\n"
+            "\n"
+            f"    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->isEnabled()Z\n"
+            "\n"
+            "    move-result v0\n"
+            "\n"
+            "    invoke-static {v0}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;\n"
+            "\n"
+            "    move-result-object v0\n"
+            "\n"
+            "    return-object v0\n"
+            "\n"
+            f"    :{label}"
+        )
 
-    if-eqz v0, :patch_assoc_get_continue
-
-    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->isEnabled()Z
-
-    move-result v0
-
-    invoke-static {{v0}}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;
-
-    move-result-object v0
-
-    return-object v0
-
-    :patch_assoc_get_continue"""
     smali = replace_method(
-        smali,
-        ".method public static final f(Ljava/lang/String;)Ljava/lang/Object;",
-        lambda method: insert_after_registers(method, get_snippet),
+        smali, info["get_decl"],
+        lambda method: insert_after_registers(
+            method, read_snippet(info["get_key"], "patch_assoc_get_continue")
+        ),
+    )
+    smali = replace_method(
+        smali, info["get_default_decl"],
+        lambda method: insert_after_registers(
+            method,
+            read_snippet(
+                info["get_default_key"], "patch_assoc_get_default_continue"
+            ),
+        ),
     )
 
-    get_default_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-eqz v0, :patch_assoc_get_default_continue
-
-    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->isEnabled()Z
-
-    move-result v0
-
-    invoke-static {{v0}}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;
-
-    move-result-object v0
-
-    return-object v0
-
-    :patch_assoc_get_default_continue"""
-    smali = replace_method(
-        smali,
-        ".method public static final g(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
-        lambda method: insert_after_registers(method, get_default_snippet),
+    set_object_snippet = (
+        f"    invoke-static {{{info['set_key']}}}, {ASSOCIATION_PATCH_CLASS}"
+        "->isPatchKey(Ljava/lang/String;)Z\n"
+        "\n"
+        "    move-result v0\n"
+        "\n"
+        "    if-eqz v0, :patch_assoc_set_object_continue\n"
+        "\n"
+        f"    instance-of v0, {info['set_value']}, Ljava/lang/Boolean;\n"
+        "\n"
+        "    if-eqz v0, :patch_assoc_set_object_continue\n"
+        "\n"
+        f"    check-cast {info['set_value']}, Ljava/lang/Boolean;\n"
+        "\n"
+        f"    invoke-virtual {{{info['set_value']}}}, "
+        "Ljava/lang/Boolean;->booleanValue()Z\n"
+        "\n"
+        "    move-result v0\n"
+        "\n"
+        f"    invoke-static {{v0}}, {ASSOCIATION_PATCH_CLASS}->setEnabled(Z)V\n"
+        "\n"
+        "    return-void\n"
+        "\n"
+        "    :patch_assoc_set_object_continue"
     )
-
-    set_object_snippet = f"""    invoke-static {{p0}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-eqz v0, :patch_assoc_set_object_continue
-
-    instance-of v0, p1, Ljava/lang/Boolean;
-
-    if-eqz v0, :patch_assoc_set_object_continue
-
-    check-cast p1, Ljava/lang/Boolean;
-
-    invoke-virtual {{p1}}, Ljava/lang/Boolean;->booleanValue()Z
-
-    move-result v0
-
-    invoke-static {{v0}}, {ASSOCIATION_PATCH_CLASS}->setEnabled(Z)V
-
-    return-void
-
-    :patch_assoc_set_object_continue"""
-    if settings_writer:
-        set_object_declarations = [
-            f".method public static final {settings_writer}"
-            "(Ljava/lang/String;Ljava/lang/Object;)V"
-        ]
-    else:
-        set_object_declarations = [
-            ".method public static final o(Ljava/lang/String;Ljava/lang/Object;)V",
-            ".method public static final p(Ljava/lang/String;Ljava/lang/Object;)V",
-        ]
-    smali = replace_method_candidates(
-        smali,
-        set_object_declarations,
+    smali = replace_method(
+        smali, info["set_writer_decl"],
         lambda method: insert_after_registers(method, set_object_snippet),
-        "设置进程写入",
     )
 
-    set_string_snippet = f"""    invoke-static {{p1}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-eqz v0, :patch_assoc_set_string_continue
-
-    invoke-static {{p2}}, {ASSOCIATION_PATCH_CLASS}->setFromString(Ljava/lang/String;)V
-
-    return-void
-
-    :patch_assoc_set_string_continue"""
-    if ime_writer:
-        set_string_declarations = [
-            f".method public final {ime_writer}(Ljava/lang/String;Ljava/lang/String;)V"
-        ]
-    else:
-        set_string_declarations = [
-            ".method public final m(Ljava/lang/String;Ljava/lang/String;)V",
-            ".method public final o(Ljava/lang/String;Ljava/lang/String;)V",
-        ]
-    smali = replace_method_candidates(
-        smali,
-        set_string_declarations,
+    set_string_snippet = (
+        f"    invoke-static {{{info['ime_key']}}}, {ASSOCIATION_PATCH_CLASS}"
+        "->isPatchKey(Ljava/lang/String;)Z\n"
+        "\n"
+        "    move-result v0\n"
+        "\n"
+        "    if-eqz v0, :patch_assoc_set_string_continue\n"
+        "\n"
+        f"    invoke-static {{{info['ime_value']}}}, {ASSOCIATION_PATCH_CLASS}"
+        "->setFromString(Ljava/lang/String;)V\n"
+        "\n"
+        "    return-void\n"
+        "\n"
+        "    :patch_assoc_set_string_continue"
+    )
+    smali = replace_method(
+        smali, info["ime_writer_decl"],
         lambda method: insert_after_registers(method, set_string_snippet),
-        "输入法进程写入",
     )
 
-    known_key_old = """    move-result p1
-
-    if-nez p1, :cond_7e
-"""
-    known_key_new = f"""    move-result p1
-
-    if-nez p1, :cond_7e
-
-    invoke-static {{p2}}, {ASSOCIATION_PATCH_CLASS}->isPatchKey(Ljava/lang/String;)Z
-
-    move-result p1
-
-    if-nez p1, :cond_7e
-"""
-    start, end = get_method_bounds(
-        smali,
-        ".method public onSharedPreferenceChanged("
-        "Landroid/content/SharedPreferences;Ljava/lang/String;)V",
+    known_key_anchor = (
+        r"(?P<anchor>    move-result " +
+        re.escape(info["changed_result"]) + r"\n"
+        r"\n"
+        r"    if-nez " + re.escape(info["changed_result"]) + r", :" +
+        re.escape(info["changed_label"]) + r"\n)"
     )
+    known_key_insert = (
+        "\n"
+        f"    invoke-static {{{info['changed_key']}}}, {ASSOCIATION_PATCH_CLASS}"
+        "->isPatchKey(Ljava/lang/String;)Z\n"
+        "\n"
+        f"    move-result {info['changed_result']}\n"
+        "\n"
+        f"    if-nez {info['changed_result']}, :{info['changed_label']}\n"
+    )
+    start, end = get_method_bounds(smali, info["changed_decl"])
     method = smali[start:end]
-    if method.count(known_key_old) != 1:
+    method, count = re.subn(
+        known_key_anchor, r"\g<anchor>" + known_key_insert, method, count=1
+    )
+    if count != 1:
         raise ValueError("onSharedPreferenceChanged containsKey 分支不符合预期")
-    method = method.replace(known_key_old, known_key_new, 1)
     smali = smali[:start] + method + smali[end:]
 
     checks = {
@@ -604,7 +814,7 @@ def patch_settings_config(smali_path, settings_writer=None, ime_writer=None):
         "自定义配置默认读取": "patch_assoc_get_default_continue" in smali,
         "设置进程写入": "patch_assoc_set_object_continue" in smali,
         "输入法进程写入": "patch_assoc_set_string_continue" in smali,
-        "未知键转为已知键": known_key_new in smali,
+        "未知键转为已知键": known_key_insert.strip() in smali,
     }
     for desc, ok in checks.items():
         print(f"    [{'✓' if ok else '✗'}] {desc}")
@@ -675,23 +885,46 @@ def patch_keyboard_preedit_behavior(smali_path):
     # 参数类型必须与 EnglishAssociationPatch.smali 模板中的签名保持一致。
     # 使用框架接口 InputConnection 而非上游混淆类 editor/a：v1.4.6 起 editor/a
     # 已被复用为无关的 synthetic lambda 类，硬编码会让验证器报 VerifyError。
-    range_snippet = f"""    invoke-static {{v0, p0, p1}}, {ASSOCIATION_PATCH_CLASS}->suppressAsciiPreeditRange(Landroid/view/inputmethod/InputConnection;II)Z
+    def insert_preedit_guard(method):
+        """在 InputConnection 空值分支之后插入 ASCII preedit 拦截。
 
-    move-result v1
+        不能硬编码 `:cond_21`：标签名是 baksmali 按指令偏移生成的，上游加一条
+        指令就会变成 :cond_22 之类，而 str.replace 找不到时是静默无操作。这里
+        改为按 "InputConnection is null" 日志定位空值分支，取紧随其后的标签，
+        并从守卫指令里取出真正持有 InputConnection 的寄存器。
+        """
+        log_pos = method.find('"InputConnection is null"')
+        if log_pos < 0:
+            raise ValueError("SetPreeditRange 中找不到 InputConnection 空值分支")
+        guards = list(re.finditer(r"if-nez (\w+), :\w+", method[:log_pos]))
+        if not guards:
+            raise ValueError("SetPreeditRange 中找不到 InputConnection 空值判断")
+        conn_reg = guards[-1].group(1)
+        label = re.search(
+            r"^[ \t]*:\w+[ \t]*\n", method[log_pos:], re.MULTILINE
+        )
+        if label is None:
+            raise ValueError("SetPreeditRange 空值分支之后找不到标签")
+        end = log_pos + label.end()
+        snippet = (
+            f"    invoke-static {{{conn_reg}, p0, p1}}, {ASSOCIATION_PATCH_CLASS}"
+            "->suppressAsciiPreeditRange("
+            "Landroid/view/inputmethod/InputConnection;II)Z\n"
+            "\n"
+            "    move-result v1\n"
+            "\n"
+            "    if-eqz v1, :patch_ascii_preedit_continue\n"
+            "\n"
+            "    return-void\n"
+            "\n"
+            "    :patch_ascii_preedit_continue"
+        )
+        return method[:end] + snippet + "\n\n" + method[end:]
 
-    if-eqz v1, :patch_ascii_preedit_continue
-
-    return-void
-
-    :patch_ascii_preedit_continue"""
     smali = replace_method(
         smali,
         ".method public static SetPreeditRange(II)V",
-        lambda method: method.replace(
-            "    :cond_21\n",
-            "    :cond_21\n" + range_snippet + "\n\n",
-            1,
-        ),
+        insert_preedit_guard,
     )
 
     finish_snippet = f"""    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}->clearEnglishPreeditActive()V
@@ -721,10 +954,15 @@ def patch_association_fragment(smali_path):
     """在智能联想页面程序化添加英文联想开关。"""
     print("  修补 IntelligentAssociationFragment 设置页面...")
     smali = smali_path.read_text(encoding="utf-8")
-    declaration = (
-        ".method public onViewCreated("
-        "Landroid/view/View;Landroid/os/Bundle;)V"
+    # 修饰符随版本漂移（v1.5.1 起是 `public final`），按正则取真实声明行
+    declaration, _ = _locate_method(
+        smali,
+        r"\.method public (?:final )?(?P<name>onViewCreated)"
+        r"\(Landroid/view/View;Landroid/os/Bundle;\)V",
     )
+    if not declaration:
+        print("    ✗ 找不到 onViewCreated(Landroid/view/View;Landroid/os/Bundle;)V")
+        return False
     start, end = get_method_bounds(smali, declaration)
     method = smali[start:end]
     anchor = (
@@ -750,36 +988,64 @@ def patch_association_fragment(smali_path):
 
 
 def patch_board_switch_preedit(smali_path):
-    """切换到数字或符号键盘前提交英文 composing 文本。"""
+    """切换到数字或符号键盘前提交英文 composing 文本。
+
+    不能用固定寄存器锚点：v1.4.x 是 `const/4 v0, 0x5` + `switchKeyboard`，
+    v1.5.1 改成 `sget-object ... InputBoardType->kNumber` + `Enum.ordinal()`。
+    这里改为先按 kNumber/kSymbol 标记切出窗口，再取窗口内唯一的
+    `switchKeyboard(I)V` 调用点（find_board_switch_smali 已保证两个标记都存在）。
+    """
     print("  修补英文 preedit 的数字/符号键盘切换...")
     smali = smali_path.read_text(encoding="utf-8")
+
     helper_call = (
-        "    invoke-static {}, "
-        f"{ASSOCIATION_PATCH_CLASS}->commitEnglishPreeditBeforeBoardSwitch()V\n\n"
+        f"    invoke-static {{}}, {ASSOCIATION_PATCH_CLASS}"
+        "->commitEnglishPreeditBeforeBoardSwitch()V\n\n"
     )
-    anchors = [
-        (
-            "数字键盘",
-            "    const/4 v0, 0x5\n\n"
-            "    invoke-virtual {p1, v0}, "
-            "Lcom/bytedance/android/doubaoime/KeyboardJni;->switchKeyboard(I)V",
-        ),
-        (
-            "符号键盘",
-            "    invoke-virtual {p1, v1}, "
-            "Lcom/bytedance/android/doubaoime/KeyboardJni;->switchKeyboard(I)V",
-        ),
-    ]
-    for desc, anchor in anchors:
-        if smali.count(anchor) != 1:
-            print(f"    ✗ {desc} switchKeyboard 锚点数量不为 1")
-            return False
-        replacement = anchor.replace(
-            "    invoke-virtual",
-            helper_call + "    invoke-virtual",
-            1,
+    calls = [
+        match
+        for match in re.finditer(
+            r"[ \t]*invoke-virtual \{[^}]*\}, "
+            r"Lcom/bytedance/android/doubaoime/KeyboardJni;->switchKeyboard\(I\)V",
+            smali,
         )
-        smali = smali.replace(anchor, replacement, 1)
+    ]
+    boards = [
+        ("数字键盘", "InputBoardType;->kNumber"),
+        ("符号键盘", "InputBoardType;->kSymbol"),
+    ]
+
+    targets = []
+    for desc, marker in boards:
+        marker_pos = smali.find(marker)
+        if marker_pos < 0:
+            print(f"    ✗ 找不到{desc}的板型标记 {marker}")
+            return False
+        # 窗口右界取"下一个板型标记"，避免误插到另一块键盘的调用点之前
+        boundary = min(
+            (
+                pos
+                for _, other in boards
+                if other != marker
+                for pos in [smali.find(other, marker_pos + len(marker))]
+                if pos >= 0
+            ),
+            default=len(smali),
+        )
+        window = [m for m in calls if marker_pos < m.start() < boundary]
+        if len(window) != 1:
+            print(f"    ✗ {desc} switchKeyboard 锚点数量为 {len(window)}，期望 1")
+            return False
+        targets.append((desc, window[0]))
+
+    # 从后往前插入，避免前面的插入让后面的偏移失效
+    for desc, match in sorted(targets, key=lambda item: item[1].start(), reverse=True):
+        indent = re.match(r"[ \t]*", match.group(0)).group(0)
+        smali = (
+            smali[: match.start()]
+            + helper_call.replace("    ", indent, 1)
+            + smali[match.start():]
+        )
         print(f"    ✓ {desc}切换前提交英文 preedit")
 
     smali_path.write_text(smali, encoding="utf-8")
@@ -805,7 +1071,34 @@ def find_board_switch_smali(classes_out):
     return matches[0]
 
 
-def install_english_association_patch(classes_out, helper_classes_out, resource_ids):
+def resolve_switch_accessor(dex_out_dirs):
+    """探测 ImeListItemView 上返回 SwitchCompat 的无参访问器方法名。
+
+    v1.4.6 是混淆名 `a()`，v1.5.1 起上游改用 Kotlin 属性访问器
+    `getSwitchButton()`。名字写死在模板里一旦漂移就变成运行期 NoSuchMethodError
+    —— 引用完整性校验拦不住：ImeListItemView 的父类是框架类，沿继承链找不到时
+    只能判"未知"（返回 None），不能证伪。
+    """
+    relative = "com/bytedance/common_biz/ui/widget/ImeListItemView.smali"
+    for out_dir in dex_out_dirs.values():
+        path = Path(out_dir) / relative
+        if not path.exists():
+            continue
+        matches = re.findall(
+            r"^\.method public (?:final )?(?P<name>\w+)"
+            r"\(\)Landroidx/appcompat/widget/SwitchCompat;$",
+            path.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if len(matches) == 1:
+            return matches[0]
+        raise ValueError(f"ImeListItemView 的 SwitchCompat 访问器不唯一: {matches}")
+    raise ValueError(f"输入 APK 缺少 {relative}")
+
+
+def install_english_association_patch(
+    classes_out, helper_classes_out, resource_ids, dex_out_dirs
+):
     """复制辅助类并修改设置、UI、光标联想三个入口。"""
     print()
     print("  安装英文单词补全联想设置补丁...")
@@ -852,11 +1145,23 @@ def install_english_association_patch(classes_out, helper_classes_out, resource_
             return False
         association_smali = association_smali.replace(placeholder, resolved)
         print(f"    ✓ 资源 ID {placeholder} → {resolved}")
+
+    try:
+        accessor = resolve_switch_accessor(dex_out_dirs)
+    except ValueError as exc:
+        print(f"    ✗ {exc}")
+        return False
+    if SWITCH_ACCESSOR_PLACEHOLDER not in association_smali:
+        print(f"    ✗ 模板缺少占位符 {SWITCH_ACCESSOR_PLACEHOLDER}")
+        return False
+    association_smali = association_smali.replace(
+        SWITCH_ACCESSOR_PLACEHOLDER, accessor
+    )
+    print(f"    ✓ ImeListItemView 开关访问器: {accessor}()")
     association_patch_path.write_text(association_smali, encoding="utf-8")
 
-    entry, settings_writer, ime_writer = detect_settings_sync_methods(
-        settings_path, keyboard_jni_path
-    )
+    info = detect_settings_sync_methods(settings_path, keyboard_jni_path)
+    entry = info["set_entry"]
     if entry is None:
         print("    ✗ 无法确定设置写入入口，拒绝构建")
         return False
@@ -878,7 +1183,7 @@ def install_english_association_patch(classes_out, helper_classes_out, resource_
     print(f"    ✓ 监听器写入入口回填为 {entry}")
 
     return (
-        patch_settings_config(settings_path, settings_writer, ime_writer)
+        patch_settings_config(settings_path, info)
         and patch_keyboard_preedit_behavior(keyboard_jni_path)
         and patch_selection_association(selection_path)
         and patch_board_switch_preedit(board_switch_path)
@@ -1634,11 +1939,14 @@ def patch_smali(smali_path):
     with open(smali_path, "r", encoding="utf-8") as f:
         smali = f.read()
 
-    mi = smali.index(
-        ".method public static createTypeFace(Ljava/lang/String;ZI)"
-        "Landroid/graphics/Typeface;"
-    )
-    ei = smali.index(".end method", mi)
+    def method_bounds(text):
+        start = text.index(
+            ".method public static createTypeFace(Ljava/lang/String;ZI)"
+            "Landroid/graphics/Typeface;"
+        )
+        return start, text.index(".end method", start)
+
+    mi, ei = method_bounds(smali)
 
     update_call = (
         "    invoke-static {},"
@@ -1647,11 +1955,20 @@ def patch_smali(smali_path):
     )
     if update_call in smali:
         smali = smali.replace(update_call, "")
+        # 删除一行后其后所有偏移都会前移，方法边界必须重新计算，
+        # 否则下面的切片范围会溢出到相邻方法。
+        mi, ei = method_bounds(smali)
         print("  ✓ 已移除 updateIsSupportSystemFont() 调用")
     else:
         print("  - updateIsSupportSystemFont() 调用不存在")
 
-    old_start = smali.index('const-string v2, "_adaptive"', mi, ei)
+    # 目标寄存器由 baksmali 分配，随上游版本漂移（v1.4.6 是 v2，v1.5.1 变成 v0）。
+    adaptive_match = re.search(r'const-string (v\d+), "_adaptive"', smali[mi:ei])
+    if not adaptive_match:
+        print("错误：createTypeFace 中找不到 _adaptive 判断")
+        return False
+    old_start = mi + adaptive_match.start()
+
     catch_pos = smali.index(".catch Ljava/lang/Exception;", old_start, ei)
     end_of_catch = smali.index("\n", catch_pos) + 1
 
@@ -1671,8 +1988,21 @@ def patch_smali(smali_path):
         return False
     try_start_label, try_end_label, catch_label = label_match.groups()
 
+    # 风格寄存器同样随版本漂移（v1.4.6 是 v0，v1.5.1 变成 v1）。catch 兜底分支里
+    # 那句 Typeface.create(String,I) 与本补丁要做的事完全同构，直接复用它的寄存器，
+    # 避免硬编码后汇编出 "register v0 has type ... but expected ..." 之类的错误。
+    style_match = re.search(
+        r"invoke-static \{p0, (v\d+)\},\s*"
+        r"Landroid/graphics/Typeface;->create\(Ljava/lang/String;I\)",
+        smali[catch_pos:ei],
+    )
+    if not style_match:
+        print("错误：无法从 createTypeFace 的 catch 分支解析风格寄存器")
+        return False
+    style_reg = style_match.group(1)
+
     new_text = (
-        "    invoke-static {p0, v0},"
+        f"    invoke-static {{p0, {style_reg}}},"
         " Landroid/graphics/Typeface;->create(Ljava/lang/String;I)"
         "Landroid/graphics/Typeface;\n"
         "\n"
@@ -1699,7 +2029,10 @@ def patch_smali(smali_path):
         "oimeui2023 图标字体路径保留": "oimeui2023" in method,
         "oimeui2025 图标字体路径保留": "oimeui2025" in method,
         "_adaptive 判断已删除": "_adaptive" not in method,
-        "Typeface.create(String) 已添加": "invoke-static {p0, v0}, Landroid/graphics/Typeface;->create" in method,
+        "Typeface.create(String) 已添加": (
+            f"invoke-static {{p0, {style_reg}}},"
+            " Landroid/graphics/Typeface;->create" in method
+        ),
         "createFromAsset 皮肤字体保留": "createFromAsset" in method,
         "ResourcesCompat.getFont 保留": "ResourcesCompat" in method,
         "qihei 默认字体已删除": "0x7f090003" not in method,
@@ -1967,13 +2300,16 @@ def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
         with zipfile.ZipFile(input_apk) as archive:
             zip_names = archive.namelist()
             original_arsc = archive.read("resources.arsc")
-        icon_replacements, redirect_keys = collect_icon_replacements(zip_names, icon_dir)
+        mipmap_paths = parse_mipmap_paths(original_arsc)
+        icon_replacements, redirect_keys = collect_icon_replacements(
+            zip_names, icon_dir, mipmap_paths
+        )
         if not icon_replacements:
             print("  ⚠ 未收集到任何图标，本次仅输出特性版")
             icon_replacements = None
         else:
             patched_arsc, retargeted = retarget_adaptive_icon_entries(
-                original_arsc, redirect_keys
+                original_arsc, redirect_keys, mipmap_paths
             )
             for key, old_path, new_path in retargeted:
                 print(f"  ✓ 自适应图标重定向 {key}: {old_path} → {new_path}")
@@ -2033,7 +2369,7 @@ def build_apk(input_apk, output_apk, keystore_path, icon_dir=None):
             return False
 
     if not install_english_association_patch(
-        classes_out, helper_classes_out, association_resource_ids
+        classes_out, helper_classes_out, association_resource_ids, dex_out_dirs
     ):
         print("错误：英文单词补全联想补丁安装失败")
         return False
