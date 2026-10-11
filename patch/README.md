@@ -145,16 +145,17 @@ apktool 解码 APK 时会对资源文件进行重编译（PNG 重新压缩、XML
 - **apksigner**（Android SDK Build Tools 自带，优先使用）
   - 没有 apksigner 时回退到 jarsigner（仅 V1 签名）
   - V1 签名在 Android 7.0+ 上可能安装失败，可用 MT 管理器重新签名
-- Python 3
+- **Python 3.14**（版本由仓库根的 `.python-version` 固定，`uv run` 会直接复用
+  已装好的解释器；版本对不上时 uv 会另下一套，白白多装几份）
 
 ## 本地使用
 
 ```bash
-# CI/跨平台版（推荐）
-uv run --python 3.12 patch/ci-patch.py <原版.apk> <输出.apk>
+# CI/跨平台版（推荐，Python 版本由 .python-version 自动固定）
+uv run patch/ci-patch.py <原版.apk> <输出.apk>
 
 # 指定 keystore
-uv run --python 3.12 patch/ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
+uv run patch/ci-patch.py <原版.apk> <输出.apk> --keystore /path/to/debug.keystore
 ```
 
 ## 注意事项

@@ -58,6 +58,11 @@ ICON_DPI_RANK = {
     "nodpi": 0xFFFE, "anydpi": -1,
 }
 
+# 重建 APK 时的 deflate 级别。必须是显式常量而不是让解释器用默认值：
+# Python 3.13 起官方 Windows 构建换成 zlib-ng，默认级别的压缩率明显低于
+# classic zlib，会让同一份产物白白大出 4 MiB（见 write_patched_apk）。
+APK_COMPRESS_LEVEL = 9
+
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
 KEY_PASS = "android"
@@ -2155,7 +2160,17 @@ def patch_qihei_direct_loads(smali_path, description):
 
 
 def write_patched_apk(dest_path, input_apk, dex_new_paths, file_overrides):
-    """按原 ZIP 条目顺序重建 APK，替换 DEX 与指定资源内容，剥离旧签名。"""
+    """按原 ZIP 条目顺序重建 APK，替换 DEX 与指定资源内容，剥离旧签名。
+
+    压缩级别必须显式钉死：Python 3.13 起官方 Windows 构建改用 zlib-ng，
+    默认级别的压缩率明显低于原版 classic zlib，实测让同一个 APK 从 163 MiB 涨到
+    167 MiB —— 连没动过的 .so 和词典资源也会一起变大。固定 level 9 后产物大小与
+    原版基本一致，也不再随解释器漂移。
+
+    注意 compresslevel 必须逐条传给 writestr：传入 ZipInfo 时 zipfile 只读
+    zinfo._compresslevel，构造函数上的 compresslevel 对它不起作用（只影响
+    ZipFile.write()）。
+    """
     with zipfile.ZipFile(input_apk, "r") as zin:
         with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
@@ -2164,11 +2179,12 @@ def write_patched_apk(dest_path, input_apk, dex_new_paths, file_overrides):
                 if item.filename in dex_new_paths:
                     continue
                 if item.filename in file_overrides:
-                    zout.writestr(item, file_overrides[item.filename])
+                    payload = file_overrides[item.filename]
                 else:
-                    zout.writestr(item, zin.read(item.filename))
+                    payload = zin.read(item.filename)
+                zout.writestr(item, payload, compresslevel=APK_COMPRESS_LEVEL)
             for name, dex_new_path in dex_new_paths.items():
-                zout.write(dex_new_path, name)
+                zout.write(dex_new_path, name, compresslevel=APK_COMPRESS_LEVEL)
 
 
 def sign_apk(apk_path, keystore_path, apksigner, jarsigner):

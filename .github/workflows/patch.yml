@@ -142,10 +142,12 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Setup Python 3.12
+      - name: Setup Python 3.14
         uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          # 与仓库根的 .python-version 保持一致：uv 只认已装好的 3.14，
+          # 版本对不上时 uv 会自己再下一套解释器，白占空间也拖慢构建。
+          python-version: "3.14"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v10.0.1
@@ -260,7 +262,7 @@ jobs:
       - name: Generate launcher icons
         run: |
           set -euo pipefail
-          uv run --python 3.12 --with Pillow patch/gen-icons.py logo@300.png Android
+          uv run --python 3.14 --with Pillow patch/gen-icons.py logo@300.png Android
 
       - name: Patch and sign APK
         env:
@@ -269,7 +271,7 @@ jobs:
         run: |
           set -euo pipefail
           export APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
-          uv run --python 3.12 patch/ci-patch.py \
+          uv run --python 3.14 patch/ci-patch.py \
             "${{ needs.metadata.outputs.filename }}" \
             "${{ steps.names.outputs.output_file }}" \
             --keystore "$RUNNER_TEMP/debug.keystore"
